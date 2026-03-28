@@ -5,88 +5,63 @@
 // TFT display
 TeensyTFT display(10, 9, 255);
 
-// Frame buffer for PixelPlanner
-uint16_t frame[TeensyTFT::PHYS_WIDTH * TeensyTFT::PHYS_HEIGHT];
-PixelPlanner scene(frame, TeensyTFT::PHYS_WIDTH, TeensyTFT::PHYS_HEIGHT);
+// --- Test pixmap ---
+Pixmap<60,60> testmap;
+Pixmap<60,60> testmap2;
+Pixmap<60,30> testmap3;
 
-// Area sizes
-const int S1 = 32, S2 = 24;
-
-// Pixel data
-uint16_t redSquare[S1*S1];
-uint16_t blueCircle[S2*S2];
-
-// Red square motion
-float redX = 50, redY = 50;
-float redVX = 1.2, redVY = 0.9;
-
-// Blue circle motion
-float blueX = 200, blueY = 100;
-float blueVX = -0.8, blueVY = 1.1;
-
-// Area indices
-int areaRed, areaBlue;
-
-void setup() {
-    Serial.begin(115200);
-    display.begin(80000000, 1);
-
-    // Red square pixels
-    for(int i=0;i<S1*S1;i++) redSquare[i]=ILI9341_RED;
-
-    // Blue circle pixels
-    for(int row=0;row<S2;row++) {
-        for(int col=0;col<S2;col++) {
-            int dx=col-S2/2, dy=row-S2/2;
-            blueCircle[row*S2+col] = (dx*dx+dy*dy<=(S2/2)*(S2/2)) ? ILI9341_BLUE : 0x0000;
-        }
-    }
-
-    // Add areas to scene
-    areaRed = scene.addArea(S1, S1, (int)redX, (int)redY, AreaAnchor::Center, 0, redSquare, true, 1);
-    areaBlue = scene.addArea(S2, S2, (int)blueX, (int)blueY, AreaAnchor::Center, 0, blueCircle, true, 0);
-}
-
-// Check if two rectangles overlap
-bool checkOverlap(float x1, float y1, int w1, int h1,
-                  float x2, float y2, int w2, int h2) 
+void setup()
 {
-    float left1 = x1 - w1/2.0f;
-    float right1 = x1 + w1/2.0f;
-    float top1 = y1 - h1/2.0f;
-    float bottom1 = y1 + h1/2.0f;
+    Serial.begin(115200);
+    display.begin(80000000,1);
 
-    float left2 = x2 - w2/2.0f;
-    float right2 = x2 + w2/2.0f;
-    float top2 = y2 - h2/2.0f;
-    float bottom2 = y2 + h2/2.0f;
+    // --- Clear Pixmap to white ---
+    // testmap2.draw_rect(0,0,testmap2.width(),testmap2.height(),0,true,ILI9341_WHITE);
 
-    return !(left1 >= right2 || right1 <= left2 || top1 >= bottom2 || bottom1 <= top2);
+    // --- Rotated rectangle ---
+    testmap2.draw_rect_rotated(5,5,20,10,30,15,10,2,true,ILI9341_CYAN);
+    testmap2.draw_rect_rotated(5,5,20,10,30,15,10,2,false,ILI9341_RED);
+
+    // --- Lines ---
+    testmap2.draw_line_from_points(0,0,59,59,2,true,ILI9341_BLUE);
+    testmap2.draw_line_from_points(59,0,0,59,1,false,ILI9341_GREEN);
+    testmap2.draw_line_from_pt_slope(30,30,INFINITY,3,true,0,ILI9341_YELLOW);
+
+    // --- Circles ---
+    testmap2.draw_circle(30,10,8,3,true,ILI9341_YELLOW);
+    testmap2.draw_circle(30,10,8,3,false,ILI9341_PURPLE);
+    testmap2.draw_circle(50,50,5,0,true,ILI9341_ORANGE);
+
+    // // --- Rectangle ---
+    testmap2.draw_rect(10,40,20,15,3,false,ILI9341_CYAN);
+
+    // --- Filled triangle ---
+    testmap2.fill_triangle(5,55,25,45,45,55,ILI9341_MAGENTA);
+
+    // --- Blit example ---
+    uint16_t sampleArray[4] = {ILI9341_RED, ILI9341_GREEN, ILI9341_BLUE, ILI9341_YELLOW};
+    testmap3.blitFromArray(sampleArray, 2, 2, BlitMode::STRETCH, ScaleMode::BILINEAR);
+
+    // Fill white background
+    testmap.draw_rect(0,0,testmap.width(),testmap.height(),0,true,ILI9341_WHITE);
+
+    // Draw semi-transparent overlapping rectangles
+    testmap.draw_rect(5,5,30,20,0,true,ILI9341_RED,0.6f);    // 60% red
+    testmap.draw_rect(15,10,30,20,0,true,ILI9341_BLUE,0.6f);  // 60% blue overlaps red
+
+    // Draw semi-transparent lines crossing
+    testmap.draw_line_from_points(0,0,59,59,4,true,ILI9341_GREEN,0.7f);  // 70% green diagonal
+    testmap.draw_line_from_points(0,59,59,0,4,true,ILI9341_YELLOW,0.7f); // 70% yellow diagonal
+
+    // Draw semi-transparent circle on top
+    testmap.draw_circle(30,30,15,0,true,ILI9341_MAGENTA,0.5f); // 50% magenta
 }
 
-void loop() {
-    int halfWR = S1/2, halfHR = S1/2;
-    int halfWB = S2/2, halfHB = S2/2;
-
-    // Bounce red square
-    if(redX + redVX < halfWR || redX + redVX > display.width() - halfWR) redVX = -redVX;
-    if(redY + redVY < halfHR || redY + redVY > display.height() - halfHR) redVY = -redVY;
-    redX += redVX; redY += redVY;
-    scene.updateAreaLocation(areaRed, (int)redX, (int)redY, AreaAnchor::Center);
-
-    // Bounce blue circle
-    if(blueX + blueVX < halfWB || blueX + blueVX > display.width() - halfWB) blueVX = -blueVX;
-    if(blueY + blueVY < halfHB || blueY + blueVY > display.height() - halfHB) blueVY = -blueVY;
-    blueX += blueVX; blueY += blueVY;
-    scene.updateAreaLocation(areaBlue, (int)blueX, (int)blueY, AreaAnchor::Center);
-
-    // Set visibility based on overlap
-    bool overlap = checkOverlap(redX, redY, S1, S1, blueX, blueY, S2, S2);
-    scene.setAreaVisible(areaRed, !overlap);
-    scene.setAreaVisible(areaBlue, !overlap);
-
-    // Compose scene into buffer and draw
-    scene.compose(ILI9341_BLACK);
-    display.fillRegion(0, 0, display.width(), display.height(), frame);
+void loop()
+{
+    display.clear();
+    display.fillRegion(150, 150, testmap.width(),  testmap.height(),  testmap.getPixels(),  testmap.getMask());
+    display.fillRegion(80,  80,  testmap3.width(), testmap3.height(), testmap3.getPixels(), testmap3.getMask());
+    display.fillRegion(80,  80,  testmap2.width(), testmap2.height(), testmap2.getPixels(), testmap2.getMask());
     display.swap();
 }
