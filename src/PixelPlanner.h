@@ -1,5 +1,6 @@
 #pragma once
 #include <Arduino.h>
+#include "Colors.h"
 
 enum class BlitMode { TOP_LEFT,
                       TOP_RIGHT,
