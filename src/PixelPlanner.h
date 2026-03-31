@@ -2,6 +2,9 @@
 #include <Arduino.h>
 #include "Colors.h"
 
+/**
+ * @brief Defines how a source image is positioned within the destination Pixmap.
+ */
 enum class BlitMode { TOP_LEFT,
                       TOP_RIGHT,
                       BOTTOM_LEFT,
@@ -10,16 +13,37 @@ enum class BlitMode { TOP_LEFT,
                       STRETCH,
                       FIT,
                       FILL };
+
+/**
+ * @brief Defines how pixel values are interpolated during scaling.
+ */
 enum class ScaleMode { NEAREST,
                        BILINEAR,
                        AREA };
 
-// --- Alpha blending for 16-bit RGB565 ---
+/**
+ * @brief Alpha blend two RGB565 colors.
+ *
+ * @param dst   Destination pixel (background).
+ * @param src   Source pixel (foreground).
+ * @param alpha Blend factor in range [0.0, 1.0].
+ * @return Resulting blended RGB565 color.
+ */
 uint16_t blend565(uint16_t dst,
                   uint16_t src,
                   float    alpha);
 
-// --- Rotate a point around a pivot ---
+/**
+ * @brief Rotate a point around a pivot.
+ *
+ * @param px        Input point X.
+ * @param py        Input point Y.
+ * @param cx        Pivot center X.
+ * @param cy        Pivot center Y.
+ * @param angle_deg Rotation angle in degrees.
+ * @param out_x     Output rotated X.
+ * @param out_y     Output rotated Y.
+ */
 void rotate_point(float  px,
                   float  py,
                   float  cx,
@@ -28,27 +52,57 @@ void rotate_point(float  px,
                   float &out_x,
                   float &out_y);
 
+/**
+ * @brief Fixed-size 2D pixel buffer with RGB565 color and mask support.
+ *
+ * @tparam WIDTH  Width of the pixmap in pixels.
+ * @tparam HEIGHT Height of the pixmap in pixels.
+ */
 template <size_t WIDTH, size_t HEIGHT>
 class Pixmap
 {
 private:
-    uint16_t pixels[WIDTH*HEIGHT];
-    bool     mask[WIDTH*HEIGHT] = { true };
+    uint16_t pixels[WIDTH*HEIGHT];          ///< Pixel buffer (RGB565)
+    bool     mask[WIDTH*HEIGHT] = { true }; ///< Mask indicating written pixels
 
+    /**
+     * @brief Convert 2D coordinates to linear index.
+     */
     constexpr size_t index(size_t x, size_t y) const { return (y * WIDTH) + x; }
 
 public:
+    /**
+     * @brief Get pixmap width.
+     */
     constexpr size_t width()  const { return WIDTH;  }
+
+    /**
+     * @brief Get pixmap height.
+     */
     constexpr size_t height() const { return HEIGHT; }
 
+    /**
+     * @brief Clear all pixels and mask.
+     */
     void clear()
     {
         memset(pixels, 0,     sizeof(pixels));
         memset(mask,   false, sizeof(mask));
     }
 
+    /**
+     * @brief Check if coordinates are inside bounds.
+     */
     bool inBounds(size_t x, size_t y) const { return ((x < WIDTH) && (y < HEIGHT)); }
 
+    /**
+     * @brief Set a pixel with optional alpha blending.
+     *
+     * @param x     X coordinate.
+     * @param y     Y coordinate.
+     * @param value RGB565 color.
+     * @param alpha Blend factor [0.0–1.0].
+     */
     void setPixelValue(size_t   x,
                        size_t   y,
                        uint16_t value,
@@ -63,13 +117,31 @@ public:
         }
     }
 
+    /**
+     * @brief Get pixel color.
+     */
     uint16_t getPixelValue(size_t x, size_t y) const { return inBounds(x, y) ? pixels[index(x, y)] : 0; }
+
+    /**
+     * @brief Get mask value.
+     */
     uint16_t getMaskValue(size_t x,  size_t y) const { return inBounds(x, y) ? mask[index(x, y)]   : 0; }
 
+    /**
+     * @brief Get raw pixel buffer pointer.
+     */
     const uint16_t* getPixels() const { return pixels; }
+
+    /**
+     * @brief Get raw mask buffer pointer.
+     */
     const bool*     getMask()   const { return mask;   }
 
-    // --- Lines ---
+    /**
+     * @brief Draw a line between two points.
+     *
+     * Supports thickness and optional extension to pixmap borders.
+     */
     void draw_line_from_points(float    x1,
                                float    y1,
                                float    x2,
@@ -164,6 +236,9 @@ public:
         }
     }
 
+    /**
+     * @brief Draw a line from a point and slope.
+     */
     void draw_line_from_pt_slope(float    x,
                                  float    y,
                                  float    slope,
@@ -255,7 +330,9 @@ public:
                               alpha);
     }
 
-    // --- Circle ---
+    /**
+     * @brief Draw a circle or ring.
+     */
     void draw_circle(int      cx,
                      int      cy,
                      int      radius,
@@ -289,7 +366,9 @@ public:
         }
     }
 
-    // --- Rectangle ---
+    /**
+     * @brief Draw a rectangle (filled or outlined).
+     */
     void draw_rect(int      x,
                    int      y,
                    int      w,
@@ -348,7 +427,9 @@ public:
         }
     }
 
-    // --- Filled triangle ---
+    /**
+     * @brief Fill a triangle using barycentric edge tests.
+     */
     void fill_triangle(int      x0,
                        int      y0,
                        int      x1,
@@ -378,7 +459,9 @@ public:
             }
     }
 
-    // --- Rotated rectangle ---
+    /**
+     * @brief Draw a rotated rectangle (filled or outlined).
+     */
     void draw_rect_rotated(float    x,
                            float    y,
                            float    w,
@@ -486,6 +569,18 @@ public:
         }
     }
 
+    /**
+     * @brief Blit raw pixel data into the Pixmap with scaling and placement modes.
+     *
+     * @tparam T Source pixel type.
+     * @param src       Source buffer.
+     * @param srcW      Source width.
+     * @param srcH      Source height.
+     * @param mode      Placement mode.
+     * @param scaleMode Scaling algorithm.
+     * @param convert   Optional conversion function to RGB565.
+     * @param alpha     Blend factor.
+     */
     template <typename T>
     void blitFromArray(const T*  src,
                        size_t    srcW,
