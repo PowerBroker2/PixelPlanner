@@ -203,7 +203,7 @@ public:
         float px = -dy_f / len; 
         float py =  dx_f / len;
 
-        int half_thick = (int)(thickness / 2.0f);
+        int half_thick = (int)max(1.0f, thickness / 2.0f);
 
         while (true)
         {
@@ -345,7 +345,7 @@ public:
             return;
         
         int r_outer = radius;
-        int r_inner = solid ? 0 : max(0, radius - thickness);
+        int r_inner = solid ? 0 : max(0, radius - max(1, thickness));
 
         for (int y = -r_outer; y <= r_outer; y++)
         {
