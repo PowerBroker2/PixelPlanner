@@ -1,6 +1,7 @@
 #include <Arduino.h>
 #include "TeensyTFT.h"
 #include "PixelPlanner.h"
+#include "test_png.h"
 
 // TFT display
 TeensyTFT display(10, 9, 255);
@@ -16,6 +17,7 @@ Pixmap<60, 60> polylinemap;  ///< draw_polyline example
 Pixmap<60, 60> polygonmap;   ///< draw_polygon examples
 Pixmap<60, 60> floodfillmap; ///< flood_fill example
 Pixmap<60, 60> blitmap;      ///< blit_from_pixmap example
+Pixmap<60, 60> pngmap;      ///< 
 
 void setup()
 {
@@ -138,23 +140,23 @@ void setup()
 
     // Blit again into bottom-right, stretched to fill, at 60% opacity
     blitmap.blit_from_pixmap(srcmap, BlitMode::BOTTOM_RIGHT, ScaleMode::BILINEAR, 0.6f);
+
+    pngmap.blitFromArray(test_png_pixels, TEST_PNG_WIDTH, TEST_PNG_HEIGHT, BlitMode::FILL, ScaleMode::BILINEAR);
 }
 
 void loop()
 {
     display.clear();
 
-    // --- Existing pixmaps ---
-    display.fillRegion(150, 150, testmap.width(),  testmap.height(),  testmap.getPixels(),  testmap.getMask());
-    display.fillRegion(80,  80,  testmap3.width(), testmap3.height(), testmap3.getPixels(), testmap3.getMask());
-    display.fillRegion(80,  80,  testmap2.width(), testmap2.height(), testmap2.getPixels(), testmap2.getMask());
-
-    // --- New feature pixmaps ---
+    display.fillRegion(150, 150, testmap.width(),      testmap.height(),      testmap.getPixels(),      testmap.getMask());
+    display.fillRegion(80,  80,  testmap3.width(),     testmap3.height(),     testmap3.getPixels(),     testmap3.getMask());
+    display.fillRegion(80,  80,  testmap2.width(),     testmap2.height(),     testmap2.getPixels(),     testmap2.getMask());
     display.fillRegion(10,  10,  arcmap.width(),       arcmap.height(),       arcmap.getPixels(),       arcmap.getMask());
     display.fillRegion(80,  10,  polylinemap.width(),  polylinemap.height(),  polylinemap.getPixels(),  polylinemap.getMask());
     display.fillRegion(150, 10,  polygonmap.width(),   polygonmap.height(),   polygonmap.getPixels(),   polygonmap.getMask());
     display.fillRegion(10,  80,  floodfillmap.width(), floodfillmap.height(), floodfillmap.getPixels(), floodfillmap.getMask());
     display.fillRegion(220, 10,  blitmap.width(),      blitmap.height(),      blitmap.getPixels(),      blitmap.getMask());
+    display.fillRegion(150, 80,  pngmap.width(),       pngmap.height(),       pngmap.getPixels(),       pngmap.getMask());
 
     display.swap();
 }
