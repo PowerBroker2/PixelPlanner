@@ -141,7 +141,7 @@ void setup()
     // Blit again into bottom-right, stretched to fill, at 60% opacity
     blitmap.blit_from_pixmap(srcmap, BlitMode::BOTTOM_RIGHT, ScaleMode::BILINEAR, 0.6f);
 
-    pngmap.blitFromArray(test_png_pixels, TEST_PNG_WIDTH, TEST_PNG_HEIGHT, BlitMode::FILL, ScaleMode::BILINEAR);
+    pngmap.blitFromArray(test_png_pixels, TEST_PNG_WIDTH, TEST_PNG_HEIGHT, BlitMode::FIT, ScaleMode::BILINEAR);
 }
 
 void loop()
