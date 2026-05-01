@@ -62,13 +62,13 @@ template <size_t WIDTH, size_t HEIGHT>
 class Pixmap
 {
 private:
-    uint16_t pixels[WIDTH*HEIGHT];          ///< Pixel buffer (RGB565)
-    bool     mask[WIDTH*HEIGHT] = { true }; ///< Mask indicating written pixels
+    uint16_t pixels[WIDTH*HEIGHT] = {};     ///< Pixel buffer (RGB565)
+    bool     mask[WIDTH*HEIGHT]   = {};     ///< Mask indicating written pixels (false = not yet written)
 
     /**
-     * @brief Convert 2D coordinates to linear index.
+     * @brief Convert 2D coordinates to linear index (caller must ensure in-bounds).
      */
-    constexpr size_t index(size_t x, size_t y) const { return (y * WIDTH) + x; }
+    constexpr size_t index(int x, int y) const { return (size_t)(y * (int)WIDTH + x); }
 
 public:
     /**
@@ -86,14 +86,14 @@ public:
      */
     void clear()
     {
-        memset(pixels, 0,     sizeof(pixels));
-        memset(mask,   false, sizeof(mask));
+        memset(pixels, 0, sizeof(pixels));
+        memset(mask,   0, sizeof(mask));
     }
 
     /**
      * @brief Check if coordinates are inside bounds.
      */
-    bool inBounds(size_t x, size_t y) const { return ((x < WIDTH) && (y < HEIGHT)); }
+    bool inBounds(int x, int y) const { return ((x >= 0) && (y >= 0) && (x < (int)WIDTH) && (y < (int)HEIGHT)); }
 
     /**
      * @brief Set a pixel with optional alpha blending.
@@ -103,8 +103,8 @@ public:
      * @param value RGB565 color.
      * @param alpha Blend factor [0.0–1.0].
      */
-    void setPixelValue(size_t   x,
-                       size_t   y,
+    void setPixelValue(int      x,
+                       int      y,
                        uint16_t value,
                        float    alpha = 1.0f)
     {
@@ -120,12 +120,12 @@ public:
     /**
      * @brief Get pixel color.
      */
-    uint16_t getPixelValue(size_t x, size_t y) const { return inBounds(x, y) ? pixels[index(x, y)] : 0; }
+    uint16_t getPixelValue(int x, int y) const { return inBounds(x, y) ? pixels[index(x, y)] : 0; }
 
     /**
      * @brief Get mask value.
      */
-    uint16_t getMaskValue(size_t x,  size_t y) const { return inBounds(x, y) ? mask[index(x, y)]   : 0; }
+    bool getMaskValue(int x, int y) const { return inBounds(x, y) ? mask[index(x, y)] : false; }
 
     /**
      * @brief Get raw pixel buffer pointer.
@@ -403,8 +403,6 @@ public:
         if (w <= 0 || h <= 0)
             return;
 
-        thickness = max(1, thickness);
-
         if (solid)
         {
             for (int j = 0; j < h; j++)
@@ -416,8 +414,9 @@ public:
             return;
         }
 
+        // Outline path: clamp thickness to [1, half the smaller dimension]
         int max_thick = min(w / 2, h / 2);
-        thickness     = min(thickness, max_thick);
+        thickness     = max(1, min(thickness, max_thick));
 
         for(int t = 0; t < thickness; t++)
         {
@@ -586,21 +585,21 @@ public:
                 float vx3 = xe - px;
                 float vy3 = ye - py;
 
-                fill_triangle((int)(vx0 + 0.5f),
-                              (int)(vy0 + 0.5f),
-                              (int)(vx1 + 0.5f),
-                              (int)(vy1 + 0.5f),
-                              (int)(vx2 + 0.5f),
-                              (int)(vy2 + 0.5f),
+                fill_triangle((int)roundf(vx0),
+                              (int)roundf(vy0),
+                              (int)roundf(vx1),
+                              (int)roundf(vy1),
+                              (int)roundf(vx2),
+                              (int)roundf(vy2),
                               color,
                               alpha);
 
-                fill_triangle((int)(vx1 + 0.5f),
-                              (int)(vy1 + 0.5f),
-                              (int)(vx3 + 0.5f),
-                              (int)(vy3 + 0.5f),
-                              (int)(vx2 + 0.5f),
-                              (int)(vy2 + 0.5f),
+                fill_triangle((int)roundf(vx1),
+                              (int)roundf(vy1),
+                              (int)roundf(vx3),
+                              (int)roundf(vy3),
+                              (int)roundf(vx2),
+                              (int)roundf(vy2),
                               color,
                               alpha);
             };
@@ -1205,52 +1204,60 @@ public:
                 float srcXf = (x - offsetX) * scaleX;
                 float srcYf = (y - offsetY) * scaleY;
 
-                uint16_t c = 0;
+                uint16_t c       = 0;
+                bool     src_set = false;
 
                 if (scaleMode == ScaleMode::NEAREST)
                 {
-                    int xi = roundf(srcXf);
-                    int yi = roundf(srcYf);
+                    int xi = (int)roundf(srcXf);
+                    int yi = (int)roundf(srcYf);
 
                     if ((xi >= 0) && (xi < (int)srcW) && (yi >= 0) && (yi < (int)srcH))
-                        c = toColor(src[yi * srcW + xi]);
+                    {
+                        c       = toColor(src[yi * srcW + xi]);
+                        src_set = true;
+                    }
                 }
                 else if (scaleMode == ScaleMode::BILINEAR)
                 {
-                    int x0 = floorf(srcXf);
-                    int y0 = floorf(srcYf);
+                    int x0 = (int)floorf(srcXf);
+                    int y0 = (int)floorf(srcYf);
                     int x1 = min(x0 + 1, (int)srcW - 1);
                     int y1 = min(y0 + 1, (int)srcH - 1);
 
-                    float fx = srcXf - x0;
-                    float fy = srcYf - y0;
-
-                    uint16_t c00 = toColor(src[y0 * srcW + x0]);
-                    uint16_t c10 = toColor(src[y0 * srcW + x1]);
-                    uint16_t c01 = toColor(src[y1 * srcW + x0]);
-                    uint16_t c11 = toColor(src[y1 * srcW + x1]);
-
-                    auto lerp565 = [](uint16_t a, uint16_t b, float t) -> uint16_t
+                    if ((x0 >= 0) && (x0 < (int)srcW) && (y0 >= 0) && (y0 < (int)srcH))
                     {
-                        int ar = (a >> 11) & 0x1F;
-                        int ag = (a >> 5)  & 0x3F;
-                        int ab =  a & 0x1F;
+                        float fx = srcXf - x0;
+                        float fy = srcYf - y0;
 
-                        int br = (b >> 11) & 0x1F;
-                        int bg = (b >> 5)  & 0x3F;
-                        int bb =  b & 0x1F;
+                        uint16_t c00 = toColor(src[y0 * srcW + x0]);
+                        uint16_t c10 = toColor(src[y0 * srcW + x1]);
+                        uint16_t c01 = toColor(src[y1 * srcW + x0]);
+                        uint16_t c11 = toColor(src[y1 * srcW + x1]);
 
-                        int rr = ar + (int)((br - ar) * t);
-                        int rg = ag + (int)((bg - ag) * t);
-                        int rb = ab + (int)((bb - ab) * t);
+                        auto lerp565 = [](uint16_t a, uint16_t b, float t) -> uint16_t
+                        {
+                            int ar = (a >> 11) & 0x1F;
+                            int ag = (a >> 5)  & 0x3F;
+                            int ab =  a & 0x1F;
 
-                        return (rr << 11) | (rg << 5) | rb;
-                    };
+                            int br = (b >> 11) & 0x1F;
+                            int bg = (b >> 5)  & 0x3F;
+                            int bb =  b & 0x1F;
 
-                    uint16_t cx0 = lerp565(c00, c10, fx);
-                    uint16_t cx1 = lerp565(c01, c11, fx);
+                            int rr = ar + (int)((br - ar) * t);
+                            int rg = ag + (int)((bg - ag) * t);
+                            int rb = ab + (int)((bb - ab) * t);
 
-                    c = lerp565(cx0, cx1, fy);
+                            return (uint16_t)((rr << 11) | (rg << 5) | rb);
+                        };
+
+                        uint16_t cx0 = lerp565(c00, c10, fx);
+                        uint16_t cx1 = lerp565(c01, c11, fx);
+
+                        c       = lerp565(cx0, cx1, fy);
+                        src_set = true;
+                    }
                 }
                 else if (scaleMode == ScaleMode::AREA)
                 {
@@ -1304,15 +1311,17 @@ public:
                         r /= total;
                         g /= total;
                         b /= total;
+                        src_set = true;
                     }
 
                     c = ((int)r << 11) | ((int)g << 5) | (int)b;
                 }
 
-                setPixelValue(x,
-                              y,
-                              c,
-                              alpha);
+                if (src_set)
+                    setPixelValue(x,
+                                  y,
+                                  c,
+                                  alpha);
             }
         }
     }
