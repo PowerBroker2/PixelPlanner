@@ -1317,7 +1317,7 @@ public:
                     c = ((int)r << 11) | ((int)g << 5) | (int)b;
                 }
 
-                if (src_set)
+                if (src_set && c >= 0)
                     setPixelValue(x,
                                   y,
                                   c,
