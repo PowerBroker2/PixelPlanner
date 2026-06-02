@@ -22,7 +22,7 @@ Pixmap<60, 60> pngmap;      ///<
 void setup()
 {
     Serial.begin(115200);
-    display.begin(80000000, 1);
+    display.begin();
 
     // =========================================================
     // --- Existing examples (unchanged) ---
