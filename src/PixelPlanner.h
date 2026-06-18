@@ -2,6 +2,28 @@
 #include <Arduino.h>
 #include "Colors.h"
 
+#ifndef CUSTOM_BITMAP_FONT_H
+#define CUSTOM_BITMAP_FONT_H
+
+struct Glyph {
+  const bool* data;
+  int width;
+};
+
+class BitmapFont {
+public:
+  typedef Glyph (*LookupFunc)(char);
+private:
+  LookupFunc _lookup;
+  int _height;
+public:
+  BitmapFont(LookupFunc lookup, int height) : _lookup(lookup), _height(height) {}
+  inline Glyph lookupChar(char c) const { return _lookup(c); }
+  inline int getHeight() const { return _height; }
+};
+
+#endif // CUSTOM_BITMAP_FONT_H
+
 /**
  * @brief Defines how a source image is positioned within the destination Pixmap.
  */
@@ -1117,212 +1139,277 @@ public:
         }
     }
 
-    /**
-     * @brief Blit raw pixel data into the Pixmap with scaling and placement modes.
-     *
-     * @tparam T        Source pixel type.
-     * @param src       Source buffer.
-     * @param srcW      Source width.
-     * @param srcH      Source height.
-     * @param mode      Placement mode.
-     * @param scaleMode Scaling algorithm.
-     * @param convert   Optional conversion function to RGB565.
-     * @param alpha     Blend factor.
-     */
-    template <typename T>
-    void blitFromArray(const T*  src,
-                       size_t    srcW,
-                       size_t    srcH,
-                       BlitMode  mode,
-                       ScaleMode scaleMode     = ScaleMode::BILINEAR,
-                       uint16_t  (*convert)(T) = nullptr,
-                       float     alpha         = 1.0f)
+    void blitFromArray(const uint16_t* src,
+                       size_t srcW,
+                       size_t srcH,
+                       BlitMode mode,
+                       ScaleMode scaleMode = ScaleMode::BILINEAR,
+                       float alpha = 1.0f,
+                       int destX = 0,
+                       int destY = 0,
+                       int destW = -1,
+                       int destH = -1)
     {
         if (!src || (srcW == 0) || (srcH == 0))
             return;
 
-        auto toColor = [&](T v) -> uint16_t
-        {
-            return convert ? convert(v) : (uint16_t)v;
-        };
+        int subW = (destW < 0) ? (int)width() - destX : destW;
+        int subH = (destH < 0) ? (int)height() - destY : destH;
 
-        // --- Determine drawing area and scaling ---
+        int startX = max(0, destX);
+        int startY = max(0, destY);
+        int endX   = min((int)width(), startX + subW);
+        int endY   = min((int)height(), startY + subH);
+
         float drawW = (float)srcW;
         float drawH = (float)srcH;
+        float offsetX = (float)startX;
+        float offsetY = (float)startY;
 
-        float offsetX = 0.0f;
-        float offsetY = 0.0f;
-
-        if (mode == BlitMode::STRETCH)
-        {
-            drawW = (float)width();
-            drawH = (float)height();
-        }
-        else if ((mode == BlitMode::FIT) || (mode == BlitMode::FILL))
-        {
-            float sx = (float)width()  / srcW;
-            float sy = (float)height() / srcH;
+        if (mode == BlitMode::STRETCH) {
+            drawW = (float)subW;
+            drawH = (float)subH;
+        } else if ((mode == BlitMode::FIT) || (mode == BlitMode::FILL)) {
+            float sx = (float)subW / srcW;
+            float sy = (float)subH / srcH;
             float s  = (mode == BlitMode::FIT) ? min(sx, sy) : max(sx, sy);
-
             drawW = srcW * s;
             drawH = srcH * s;
+            offsetX += (subW - drawW) * 0.5f;
+            offsetY += (subH - drawH) * 0.5f;
+        } else if (mode == BlitMode::CENTER) {
+            offsetX += (subW - srcW) * 0.5f;
+            offsetY += (subH - srcH) * 0.5f;
+        } else if (mode == BlitMode::TOP_RIGHT) {
+            offsetX += (subW - srcW);
+        } else if (mode == BlitMode::BOTTOM_LEFT) {
+            offsetY += (subH - srcH);
+        } else if (mode == BlitMode::BOTTOM_RIGHT) {
+            offsetX += (subW - srcW);
+            offsetY += (subH - srcH);
+        }
 
-            offsetX = (width()  - drawW) * 0.5f;
-            offsetY = (height() - drawH) * 0.5f;
-        }
-        else if (mode == BlitMode::CENTER)
-        {
-            offsetX = (width()  - srcW) * 0.5f;
-            offsetY = (height() - srcH) * 0.5f;
-        }
-        else if (mode == BlitMode::TOP_RIGHT)
-        {
-            offsetX = width() - srcW;
-            offsetY = 0;
-        }
-        else if (mode == BlitMode::BOTTOM_LEFT)
-        {
-            offsetX = 0;
-            offsetY = height() - srcH;
-        }
-        else if (mode == BlitMode::BOTTOM_RIGHT)
-        {
-            offsetX = width() - srcW;
-            offsetY = height() - srcH;
-        }
-        // TOP_LEFT: offsetX = offsetY = 0
-
-        // --- Compute scale from dest → src ---
         float scaleX = (drawW > 1) ? (srcW - 1) / (drawW - 1) : 0;
         float scaleY = (drawH > 1) ? (srcH - 1) / (drawH - 1) : 0;
 
-        // --- Main loop ---
-        for (int y = 0; y < (int)height(); y++)
-        {
-            for (int x = 0; x < (int)width(); x++)
-            {
+        for (int y = startY; y < endY; y++) {
+            for (int x = startX; x < endX; x++) {
                 float srcXf = (x - offsetX) * scaleX;
                 float srcYf = (y - offsetY) * scaleY;
+                uint16_t c = 0;
+                bool src_set = false;
 
-                uint16_t c       = 0;
-                bool     src_set = false;
-
-                if (scaleMode == ScaleMode::NEAREST)
-                {
+                if (scaleMode == ScaleMode::NEAREST) {
                     int xi = (int)roundf(srcXf);
                     int yi = (int)roundf(srcYf);
-
-                    if ((xi >= 0) && (xi < (int)srcW) && (yi >= 0) && (yi < (int)srcH))
-                    {
-                        c       = toColor(src[yi * srcW + xi]);
+                    if ((xi >= 0) && (xi < (int)srcW) && (yi >= 0) && (yi < (int)srcH)) {
+                        c = pgm_read_word(&src[yi * srcW + xi]);
                         src_set = true;
                     }
-                }
-                else if (scaleMode == ScaleMode::BILINEAR)
-                {
+                } else if (scaleMode == ScaleMode::BILINEAR) {
                     int x0 = (int)floorf(srcXf);
                     int y0 = (int)floorf(srcYf);
                     int x1 = min(x0 + 1, (int)srcW - 1);
                     int y1 = min(y0 + 1, (int)srcH - 1);
-
-                    if ((x0 >= 0) && (x0 < (int)srcW) && (y0 >= 0) && (y0 < (int)srcH))
-                    {
+                    if ((x0 >= 0) && (x0 < (int)srcW) && (y0 >= 0) && (y0 < (int)srcH)) {
                         float fx = srcXf - x0;
                         float fy = srcYf - y0;
-
-                        uint16_t c00 = toColor(src[y0 * srcW + x0]);
-                        uint16_t c10 = toColor(src[y0 * srcW + x1]);
-                        uint16_t c01 = toColor(src[y1 * srcW + x0]);
-                        uint16_t c11 = toColor(src[y1 * srcW + x1]);
-
-                        auto lerp565 = [](uint16_t a, uint16_t b, float t) -> uint16_t
-                        {
-                            int ar = (a >> 11) & 0x1F;
-                            int ag = (a >> 5)  & 0x3F;
-                            int ab =  a & 0x1F;
-
-                            int br = (b >> 11) & 0x1F;
-                            int bg = (b >> 5)  & 0x3F;
-                            int bb =  b & 0x1F;
-
-                            int rr = ar + (int)((br - ar) * t);
-                            int rg = ag + (int)((bg - ag) * t);
-                            int rb = ab + (int)((bb - ab) * t);
-
+                        uint16_t v00 = pgm_read_word(&src[y0 * srcW + x0]);
+                        uint16_t v10 = pgm_read_word(&src[y0 * srcW + x1]);
+                        uint16_t v01 = pgm_read_word(&src[y1 * srcW + x0]);
+                        uint16_t v11 = pgm_read_word(&src[y1 * srcW + x1]);
+                        auto lerp = [](uint16_t a, uint16_t b, float t) -> uint16_t {
+                            int ar = (a >> 11) & 0x1F, ag = (a >> 5) & 0x3F, ab = a & 0x1F;
+                            int br = (b >> 11) & 0x1F, bg = (b >> 5) & 0x3F, bb = b & 0x1F;
+                            int rr = ar + (int)((br - ar) * t), rg = ag + (int)((bg - ag) * t), rb = ab + (int)((bb - ab) * t);
                             return (uint16_t)((rr << 11) | (rg << 5) | rb);
                         };
-
-                        uint16_t cx0 = lerp565(c00, c10, fx);
-                        uint16_t cx1 = lerp565(c01, c11, fx);
-
-                        c       = lerp565(cx0, cx1, fy);
+                        c = lerp(lerp(v00, v10, fx), lerp(v01, v11, fx), fy);
                         src_set = true;
                     }
-                }
-                else if (scaleMode == ScaleMode::AREA)
-                {
-                    float x0 = srcXf;
-                    float y0 = srcYf;
-                    float x1 = srcXf + scaleX;
-                    float y1 = srcYf + scaleY;
-
-                    float r     = 0;
-                    float g     = 0;
-                    float b     = 0;
-                    float total = 0;
-
-                    int ix0 = floorf(x0);
-                    int iy0 = floorf(y0);
-                    int ix1 = ceilf(x1);
-                    int iy1 = ceilf(y1);
-
-                    for (int sy = iy0; sy < iy1; sy++)
-                    {
-                        if ((sy < 0) || (sy >= (int)srcH))
-                            continue;
-
+                } else if (scaleMode == ScaleMode::AREA) {
+                    float x0 = srcXf, y0 = srcYf, x1 = srcXf + scaleX, y1 = srcYf + scaleY;
+                    float r = 0, g = 0, b = 0, total = 0;
+                    int ix0 = floorf(x0), iy0 = floorf(y0), ix1 = ceilf(x1), iy1 = ceilf(y1);
+                    for (int sy = iy0; sy < iy1; sy++) {
+                        if ((sy < 0) || (sy >= (int)srcH)) continue;
                         float wy = min(y1, (float)(sy + 1)) - max(y0, (float)sy);
-
-                        if (wy <= 0)
-                            continue;
-
-                        for (int sx = ix0; sx < ix1; sx++)
-                        {
-                            if ((sx < 0) || (sx >= (int)srcW))
-                                continue;
-
+                        if (wy <= 0) continue;
+                        for (int sx = ix0; sx < ix1; sx++) {
+                            if ((sx < 0) || (sx >= (int)srcW)) continue;
                             float wx = min(x1, (float)(sx + 1)) - max(x0, (float)sx);
-
-                            if (wx <= 0)
-                                continue;
-
-                            float    w   = wx * wy;
-                            uint16_t pix = toColor(src[sy * srcW + sx]);
-
-                            r     += ((pix >> 11) & 0x1F) * w;
-                            g     += ((pix >> 5)  & 0x3F) * w;
-                            b     +=  (pix        & 0x1F) * w;
-                            total +=   w;
+                            if (wx <= 0) continue;
+                            float w = wx * wy;
+                            uint16_t pix = pgm_read_word(&src[sy * srcW + sx]);
+                            r += ((pix >> 11) & 0x1F) * w;
+                            g += ((pix >> 5) & 0x3F) * w;
+                            b += (pix & 0x1F) * w;
+                            total += w;
                         }
                     }
-
-                    if (total > 0)
-                    {
-                        r /= total;
-                        g /= total;
-                        b /= total;
+                    if (total > 0) {
+                        c = ((int)(r / total) << 11) | ((int)(g / total) << 5) | (int)(b / total);
                         src_set = true;
                     }
+                }
+                if (src_set) setPixelValue(x, y, c, alpha);
+            }
+        }
+    }
 
-                    c = ((int)r << 11) | ((int)g << 5) | (int)b;
+    void blitFromArray(const bool* src,
+                       size_t srcW,
+                       size_t srcH,
+                       uint16_t color,
+                       BlitMode mode,
+                       ScaleMode scaleMode = ScaleMode::BILINEAR,
+                       float alpha = 1.0f,
+                       int destX = 0,
+                       int destY = 0,
+                       int destW = -1,
+                       int destH = -1)
+    {
+        if (!src || srcW == 0 || srcH == 0) return;
+
+        // 1. Calculate Positioning and Geometry
+        int subW = (destW < 0) ? (int)width() - destX : destW;
+        int subH = (destH < 0) ? (int)height() - destY : destH;
+        int startX = max(0, destX);
+        int startY = max(0, destY);
+        int endX   = min((int)width(), startX + subW);
+        int endY   = min((int)height(), startY + subH);
+
+        float drawW = (float)srcW;
+        float drawH = (float)srcH;
+        float offsetX = (float)startX;
+        float offsetY = (float)startY;
+
+        // Apply BlitMode (Positioning)
+        if (mode == BlitMode::STRETCH) {
+            drawW = (float)subW;
+            drawH = (float)subH;
+        } else if ((mode == BlitMode::FIT) || (mode == BlitMode::FILL)) {
+            float sx = (float)subW / srcW;
+            float sy = (float)subH / srcH;
+            float s  = (mode == BlitMode::FIT) ? min(sx, sy) : max(sx, sy);
+            drawW = srcW * s;
+            drawH = srcH * s;
+            offsetX += (subW - drawW) * 0.5f;
+            offsetY += (subH - drawH) * 0.5f;
+        } else if (mode == BlitMode::CENTER) {
+            offsetX += (subW - srcW) * 0.5f;
+            offsetY += (subH - srcH) * 0.5f;
+        } else if (mode == BlitMode::TOP_RIGHT) {
+            offsetX += (subW - srcW);
+        } else if (mode == BlitMode::BOTTOM_LEFT) {
+            offsetY += (subH - srcH);
+        } else if (mode == BlitMode::BOTTOM_RIGHT) {
+            offsetX += (subW - srcW);
+            offsetY += (subH - srcH);
+        }
+
+        float scaleX = (drawW > 1) ? (srcW - 1) / (drawW - 1) : 0;
+        float scaleY = (drawH > 1) ? (srcH - 1) / (drawH - 1) : 0;
+
+        // 2. Rendering Loop with Binary Masking
+        for (int y = startY; y < endY; y++) {
+            for (int x = startX; x < endX; x++) {
+                
+                // FIX: If the canvas pixel is in the FIT/CENTER letterboxing or pillarboxing 
+                // padding zones, completely ignore it and move to the next pixel.
+                if (x < offsetX || x >= offsetX + drawW || y < offsetY || y >= offsetY + drawH) {
+                    continue;
                 }
 
-                if (src_set && c >= 0)
-                    setPixelValue(x,
-                                  y,
-                                  c,
-                                  alpha);
+                float srcXf = (x - offsetX) * scaleX;
+                float srcYf = (y - offsetY) * scaleY;
+                bool draw = false;
+
+                if (scaleMode == ScaleMode::NEAREST) {
+                    int xi = (int)roundf(srcXf);
+                    int yi = (int)roundf(srcYf);
+                    if (xi >= 0 && xi < (int)srcW && yi >= 0 && yi < (int)srcH) {
+                        draw = pgm_read_byte(&src[yi * srcW + xi]);
+                    }
+                } else {
+                    // BILINEAR/AREA logic for bool: perform a local neighborhood OR
+                    int x0 = (int)floorf(srcXf);
+                    int y0 = (int)floorf(srcYf);
+                    int x1 = x0 + 1;
+                    int y1 = y0 + 1;
+                    
+                    // Safe bounds checks for all 4 neighborhood pixels
+                    bool p00 = (x0 >= 0 && x0 < (int)srcW && y0 >= 0 && y0 < (int)srcH) ? pgm_read_byte(&src[y0 * srcW + x0]) : false;
+                    bool p10 = (x1 >= 0 && x1 < (int)srcW && y0 >= 0 && y0 < (int)srcH) ? pgm_read_byte(&src[y0 * srcW + x1]) : false;
+                    bool p01 = (x0 >= 0 && x0 < (int)srcW && y1 >= 0 && y1 < (int)srcH) ? pgm_read_byte(&src[y1 * srcW + x0]) : false;
+                    bool p11 = (x1 >= 0 && x1 < (int)srcW && y1 >= 0 && y1 < (int)srcH) ? pgm_read_byte(&src[y1 * srcW + x1]) : false;
+                    
+                    if (p00 || p10 || p01 || p11) {
+                        draw = true;
+                    }
+                }
+
+                // Apply color and alpha only where the mask is true
+                if (draw) {
+                    setPixelValue(x, y, color, alpha);
+                }
             }
+        }
+    }
+
+    void print(int x,
+               int y,
+               const char* str,
+               const BitmapFont& font,
+               uint32_t color,
+               int maxGlyphHeight = -1,
+               float spacingPercent = 0.0f)
+    {
+        int currentX = x;
+        int origHeight = font.getHeight();
+        if (origHeight <= 0) return; // Protect against division by zero
+
+        // Fallback: If no max width/height constraint is passed, use the font's native size
+        if (maxGlyphHeight <= 0) {
+            maxGlyphHeight = origHeight;
+        }
+
+        // Calculate the precise pixel gap to add between characters using rounding (+0.5f)
+        int spacingPixels = (int)(maxGlyphHeight * spacingPercent + 0.5f);
+
+        while (*str) {
+            char c = *str;
+            Glyph glyph = font.lookupChar(c);
+
+            if (glyph.data != nullptr) {
+                // Proportionally scale the character width based on the target height constraint
+                int targetWidth = (int)(((float)glyph.width * maxGlyphHeight) / origHeight + 0.5f);
+                if (targetWidth <= 0) targetWidth = 1; // Guarantee at least a 1-pixel column width
+
+                // Scale and draw the glyph matrix via integer-mapped nearest-neighbor interpolation
+                for (int row = 0; row < maxGlyphHeight; row++) {
+                    int origRow = (row * origHeight) / maxGlyphHeight;
+                    
+                    for (int col = 0; col < targetWidth; col++) {
+                        int origCol = (col * glyph.width) / targetWidth;
+                        int progmemIndex = origRow * glyph.width + origCol;
+                        
+                        // Read data bit out of Flash Memory safely
+                        bool pixelActive = pgm_read_byte(&(glyph.data[progmemIndex]));
+                        
+                        if (pixelActive) {
+                            this->setPixelValue(currentX + col, y + row, (uint16_t)color);
+                        }
+                    }
+                }
+                // Move cursor forward: Scaled Width + The custom proportional spacing gap
+                currentX += targetWidth + spacingPixels;
+            } 
+            else if (c == ' ') {
+                // Scale the blank space width (1/3 of total height) + The custom spacing gap
+                currentX += (maxGlyphHeight / 3) + spacingPixels;
+            }
+            str++;
         }
     }
 };
