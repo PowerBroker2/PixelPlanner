@@ -1,5 +1,7 @@
 #pragma once
 #include <Arduino.h>
+#include <limits.h>
+#include <stdlib.h>
 #include "Colors.h"
 
 #ifndef CUSTOM_BITMAP_FONT_H
@@ -43,6 +45,46 @@ enum class ScaleMode { NEAREST,
                        BILINEAR,
                        AREA };
 
+struct PixmapRect
+{
+    int x, y, width, height;
+};
+
+enum class StrokeJoin { MITER, BEVEL, ROUND };
+enum class StrokeCap { BUTT, SQUARE, ROUND };
+enum class Antialiasing { OFF, COVERAGE };
+
+struct StrokeStyle
+{
+    float width = 1.0f;
+    StrokeJoin join = StrokeJoin::MITER;
+    StrokeCap cap = StrokeCap::BUTT;
+    float miterLimit = 4.0f;
+    Antialiasing antialias = Antialiasing::OFF;
+};
+
+namespace pixelplanner_detail
+{
+    using PixelSink = void (*)(void*, int, int, uint8_t);
+    void strokePath(const float* points, size_t count, bool closed, const StrokeStyle& style,
+                    PixmapRect clip, void* target, PixelSink put);
+    void fillPath(const float* points, size_t count, PixmapRect clip, void* target, PixelSink put);
+    void radialPath(int cx, int cy, int radius, int innerRadius, float angle, float span,
+                    PixmapRect clip, void* target, PixelSink put);
+}
+
+struct BlitTransform
+{
+    // (x, y) is the destination position of the pivot within the source region.
+    // Coordinates are measured from pixel edges. Positive angles turn clockwise.
+    float x, y;
+    float angle = 0.0f;
+    float scaleX = 1.0f, scaleY = 1.0f;
+    float pivotX = 0.0f, pivotY = 0.0f;
+
+    BlitTransform(float x, float y) : x(x), y(y) {}
+};
+
 /**
  * @brief Alpha blend two RGB565 colors.
  *
@@ -80,17 +122,69 @@ void rotate_point(float  px,
  * @tparam WIDTH  Width of the pixmap in pixels.
  * @tparam HEIGHT Height of the pixmap in pixels.
  */
-template <size_t WIDTH, size_t HEIGHT>
+template <size_t WIDTH, size_t HEIGHT, bool COVERAGE = false>
 class Pixmap
 {
 private:
+    static_assert(WIDTH > 0 && HEIGHT > 0, "Pixmap dimensions must be positive");
+    static_assert(WIDTH <= INT_MAX && HEIGHT <= INT_MAX && HEIGHT <= SIZE_MAX / WIDTH,
+                  "Pixmap dimensions exceed the index range");
+
+    static int lowerBound(int64_t position, size_t extent)
+    {
+        return position <= 0 ? 0 : position >= int64_t(extent) ? int(extent) : int(position);
+    }
+
     uint16_t pixels[WIDTH*HEIGHT] = {};     ///< Pixel buffer (RGB565)
     bool     mask[WIDTH*HEIGHT]   = {};     ///< Mask indicating written pixels (false = not yet written)
+    uint8_t coverage[COVERAGE ? WIDTH * HEIGHT : 1] = {};
+    // Zero insets mean a full clip and keep zero-initialized pixmaps in BSS.
+    struct { int left, top, right, bottom; } clipInsets{};
 
     /**
      * @brief Convert 2D coordinates to linear index (caller must ensure in-bounds).
      */
-    constexpr size_t index(int x, int y) const { return (size_t)(y * (int)WIDTH + x); }
+    constexpr size_t index(int x, int y) const { return size_t(y) * WIDTH + size_t(x); }
+
+    uint8_t coverageAt(size_t i) const { return COVERAGE ? coverage[i] : mask[i] ? 255 : 0; }
+
+    void composite(size_t i, uint16_t color, float alpha)
+    {
+        if (alpha >= 1.0f)
+        {
+            pixels[i] = color;
+            mask[i] = true;
+            if (COVERAGE)
+                coverage[i] = 255;
+            return;
+        }
+        if (COVERAGE)
+        {
+            const unsigned incoming = unsigned(alpha * 255.0f + 0.5f);
+            if (!incoming)
+                return;
+            const unsigned retained = (unsigned(coverage[i]) * (255 - incoming) + 127) / 255;
+            const unsigned total = incoming + retained;
+            pixels[i] = retained ? blend565(pixels[i], color, float(incoming) / total) : color;
+            coverage[i] = uint8_t(total);
+        }
+        else
+            pixels[i] = blend565(pixels[i], color, alpha);
+        mask[i] = true;
+    }
+
+    struct Paint
+    {
+        Pixmap& target;
+        uint16_t color;
+        float alpha;
+
+        static void put(void* context, int x, int y, uint8_t opacity)
+        {
+            auto& paint = *static_cast<Paint*>(context);
+            paint.target.setPixelValue(x, y, paint.color, paint.alpha * (opacity / 255.0f));
+        }
+    };
 
 public:
     /**
@@ -110,12 +204,48 @@ public:
     {
         memset(pixels, 0, sizeof(pixels));
         memset(mask,   0, sizeof(mask));
+        if (COVERAGE)
+            memset(coverage, 0, sizeof(coverage));
+    }
+
+    // Drawing respects the clip. clear() resets the entire pixmap.
+    PixmapRect getClipRect() const
+    {
+        return {clipInsets.left, clipInsets.top,
+                int(WIDTH) - clipInsets.left - clipInsets.right,
+                int(HEIGHT) - clipInsets.top - clipInsets.bottom};
+    }
+    void resetClipRect() { clipInsets = {}; }
+    void setClipRect(PixmapRect rect)
+    {
+        resetClipRect();
+        intersectClipRect(rect);
+    }
+    void intersectClipRect(PixmapRect rect)
+    {
+        const auto clip = getClipRect();
+        const int64_t left = max(int64_t(clip.x), int64_t(rect.x));
+        const int64_t top = max(int64_t(clip.y), int64_t(rect.y));
+        const int64_t right = min(int64_t(clip.x) + clip.width,
+                                  int64_t(rect.x) + max(0, rect.width));
+        const int64_t bottom = min(int64_t(clip.y) + clip.height,
+                                   int64_t(rect.y) + max(0, rect.height));
+        if (left >= right || top >= bottom)
+            clipInsets = {0, 0, int(WIDTH), int(HEIGHT)};
+        else
+            clipInsets = {int(left), int(top), int(WIDTH) - int(right), int(HEIGHT) - int(bottom)};
     }
 
     /**
      * @brief Check if coordinates are inside bounds.
      */
     bool inBounds(int x, int y) const { return ((x >= 0) && (y >= 0) && (x < (int)WIDTH) && (y < (int)HEIGHT)); }
+
+    bool inClip(int x, int y) const
+    {
+        return x >= clipInsets.left && y >= clipInsets.top &&
+               x < int(WIDTH) - clipInsets.right && y < int(HEIGHT) - clipInsets.bottom;
+    }
 
     /**
      * @brief Set a pixel with optional alpha blending.
@@ -130,13 +260,8 @@ public:
                        uint16_t value,
                        float    alpha = 1.0f)
     {
-        if(inBounds(x, y) && alpha > 0)
-        {
-            pixels[index(x, y)] = blend565(pixels[index(x, y)],
-                                           value,
-                                           alpha);
-            mask[index(x, y)] = true;
-        }
+        if (inClip(x, y) && alpha > 0)
+            composite(index(x, y), value, alpha);
     }
 
     /**
@@ -148,6 +273,9 @@ public:
      * @brief Get mask value.
      */
     bool getMaskValue(int x, int y) const { return inBounds(x, y) ? mask[index(x, y)] : false; }
+
+    uint8_t getCoverage(int x, int y) const { return inBounds(x, y) ? coverageAt(index(x, y)) : 0; }
+    const uint8_t* getCoverage() const { return COVERAGE ? coverage : nullptr; }
 
     /**
      * @brief Get raw pixel buffer pointer.
@@ -182,74 +310,51 @@ public:
                                uint16_t color,
                                float    alpha = 1.0f)
     {
-        float dx_f = x2 - x1;
-        float dy_f = y2 - y1;
-
-        if ((dx_f == 0) && (dy_f == 0))
+        if (!isfinite(x1) || !isfinite(y1) || !isfinite(x2) || !isfinite(y2) ||
+            !isfinite(thickness))
             return;
+
+        const float dx = x2 - x1, dy = y2 - y1;
+        const float length = hypotf(dx, dy);
+        if (!isfinite(length))
+            return;
+        if (length == 0.0f)
+        {
+            if (x1 >= -0.5f && x1 < WIDTH - 0.5f && y1 >= -0.5f && y1 < HEIGHT - 0.5f)
+                setPixelValue(int(roundf(x1)), int(roundf(y1)), color, alpha);
+            return;
+        }
 
         if (border_to_border)
         {
-            float t_min = -1e9f;
-            float t_max =  1e9f;
-
-            if (dx_f != 0)
-            {
-                float tx1 = (0 - x1)            / dx_f;
-                float tx2 = (width() - 1 - x1)  / dx_f;
-
-                t_min = max(t_min, min(tx1, tx2));
-                t_max = min(t_max, max(tx1, tx2));
-            }
-
-            if (dy_f != 0)
-            {
-                float ty1 = (0 - y1)            / dy_f;
-                float ty2 = (height() - 1 - y1) / dy_f;
-
-                t_min = max(t_min, min(ty1, ty2));
-                t_max = min(t_max, max(ty1, ty2));
-            }
-
-            x1 += t_min * dx_f;
-            y1 += t_min * dy_f;
-            x2  = x1 + (t_max - t_min) * dx_f;
-            y2  = y1 + (t_max - t_min) * dy_f;
-
-            // Recompute direction after clipping
-            dx_f = x2 - x1;
-            dy_f = y2 - y1;
+            float start = -INFINITY, end = INFINITY;
+            const auto clip = [&](float origin, float step, float limit) {
+                if (step == 0.0f)
+                    return origin >= 0.0f && origin <= limit;
+                const float a = -origin / step, b = (limit - origin) / step;
+                start = max(start, min(a, b));
+                end = min(end, max(a, b));
+                return start <= end;
+            };
+            if (!clip(x1, dx, WIDTH - 1) || !clip(y1, dy, HEIGHT - 1))
+                return;
+            x2 = x1 + end * dx;
+            y2 = y1 + end * dy;
+            x1 += start * dx;
+            y1 += start * dy;
         }
 
-        float len = sqrtf((dx_f * dx_f) + (dy_f * dy_f));
-
-        if (len == 0)
-            return;
-
-        // Rasterize the thick line as a filled quad (two triangles).
-        // The old Bresenham + integer perpendicular-offset approach fails for
-        // diagonal lines: the fractional perpendicular vector causes adjacent
-        // integer t-steps to map to the same pixel (gaps) or the same pixel
-        // twice (multi-line artifact). Filling the exact bounding quad with
-        // fill_triangle covers every pixel exactly once at the true thickness.
-        float half = max(0.5f, thickness * 0.5f);
-        float px   = -(dy_f / len) * half;
-        float py   =  (dx_f / len) * half;
-
-        float vx0 = x1 + px;   float vy0 = y1 + py;
-        float vx1 = x1 - px;   float vy1 = y1 - py;
-        float vx2 = x2 + px;   float vy2 = y2 + py;
-        float vx3 = x2 - px;   float vy3 = y2 - py;
-
-        fill_triangle((int)roundf(vx0), (int)roundf(vy0),
-                      (int)roundf(vx1), (int)roundf(vy1),
-                      (int)roundf(vx2), (int)roundf(vy2),
-                      color, alpha);
-
-        fill_triangle((int)roundf(vx1), (int)roundf(vy1),
-                      (int)roundf(vx3), (int)roundf(vy3),
-                      (int)roundf(vx2), (int)roundf(vy2),
-                      color, alpha);
+        // Center the stroke on the endpoints and include the end pixels.
+        const float half = max(1.0f, thickness) * 0.5f;
+        const float u = dx / length, v = dy / length;
+        const float px = -v * half, py = u * half;
+        x1 -= u * 0.5f; y1 -= v * 0.5f;
+        x2 += u * 0.5f; y2 += v * 0.5f;
+        const float vertices[] = {
+            x1 + px + 0.5f, y1 + py + 0.5f, x2 + px + 0.5f, y2 + py + 0.5f,
+            x2 - px + 0.5f, y2 - py + 0.5f, x1 - px + 0.5f, y1 - py + 0.5f
+        };
+        draw_polygon(vertices, 4, 0.0f, true, color, alpha);
     }
 
     /**
@@ -273,86 +378,15 @@ public:
                                  uint16_t color,
                                  float    alpha = 1.0f)
     {
-        float x1;
-        float y1;
-        float x2;
-        float y2;
-
-        if (isinf(slope))
-        {
-            if (border_to_border)
-            {
-                x1 = x;
-                y1 = 0;
-                x2 = x;
-                y2 = height()-1;
-            }
-            else
-            {
-                float half = line_distance / 2.0f;
-
-                x1 = x;
-                y1 = y - half;
-                x2 = x;
-                y2 = y + half;
-            }
-        }
-        else
-        {
-            float dx  = 1.0f;
-            float dy  = slope;
-            float len = sqrtf(dx * dx + dy * dy);
-
-            dx /= len;
-            dy /= len;
-
-            if (border_to_border)
-            {
-                float t_min = -1e9;
-                float t_max =  1e9;
-
-                if (dx != 0)
-                {
-                    float tx1 = (0 - x)           / dx;
-                    float tx2 = (width() - 1 - x) / dx;
-
-                    t_min = max(t_min, min(tx1, tx2));
-                    t_max = min(t_max, max(tx1, tx2));
-                }
-
-                if (dy != 0)
-                {
-                    float ty1 = (0 - y)            / dy;
-                    float ty2 = (height() - 1 - y) / dy;
-
-                    t_min = max(t_min, min(ty1, ty2));
-                    t_max = min(t_max, max(ty1, ty2));
-                }
-
-                x1 = x + t_min * dx;
-                y1 = y + t_min * dy;
-                x2 = x + t_max * dx;
-                y2 = y + t_max * dy;
-            }
-            else
-            {
-                float half = line_distance / 2.0f;
-
-                x1 = x - dx * half;
-                y1 = y - dy * half;
-                x2 = x + dx * half;
-                y2 = y + dy * half;
-            }
-        }
-
-        draw_line_from_points(x1,
-                              y1,
-                              x2,
-                              y2,
-                              thickness,
-                              false,
-                              color,
-                              alpha);
+        if (!isfinite(x) || !isfinite(y) || isnan(slope) ||
+            (!border_to_border && !isfinite(line_distance)))
+            return;
+        const float length = hypotf(1.0f, slope);
+        const float dx = isinf(slope) ? 0.0f : 1.0f / length;
+        const float dy = isinf(slope) ? 1.0f : slope / length;
+        const float half = border_to_border ? 0.5f : line_distance * 0.5f;
+        draw_line_from_points(x - dx * half, y - dy * half, x + dx * half, y + dy * half,
+                              thickness, border_to_border, color, alpha);
     }
 
     /**
@@ -372,32 +406,35 @@ public:
                      int      thickness,
                      bool     solid,
                      uint16_t color,
-                     float    alpha = 1.0f)
+                     float    alpha = 1.0f,
+                     Antialiasing antialias = Antialiasing::OFF)
     {
-        if (radius <= 0)
+        const auto clip = getClipRect();
+        if (radius <= 0 || !(alpha > 0))
             return;
-
-        int r_outer = radius;
-        int r_inner = solid ? 0 : max(0, radius - max(1, thickness));
-
-        for (int y = -r_outer; y <= r_outer; y++)
+        const int64_t outer = radius;
+        const int64_t inner = solid ? 0 : max(0, radius - max(1, thickness));
+        if (antialias == Antialiasing::COVERAGE && alpha > 0)
         {
-            // Use sqrtf + roundf to avoid integer truncation leaving gaps near
-            // the top and bottom of the circle where the span changes rapidly.
-            int outer_x = (int)roundf(sqrtf((float)((r_outer * r_outer) - (y * y))));
-            int inner_x = (r_inner > 0) ? (int)roundf(sqrtf((float)((r_inner * r_inner) - (y * y)))) : 0;
-
-            for (int x = -outer_x; x <= -inner_x; x++)
-                setPixelValue(cx + x,
-                              cy + y,
-                              color,
-                              alpha);
-
-            for (int x = inner_x; x <= outer_x; x++)
-                setPixelValue(cx + x,
-                              cy + y,
-                              color,
-                              alpha);
+            Paint paint{*this, color, min(1.0f, alpha)};
+            pixelplanner_detail::radialPath(cx, cy, radius, int(inner), 0, 360,
+                                           clip, &paint, Paint::put);
+            return;
+        }
+        const int firstX = max(clip.x, lowerBound(int64_t(cx) - outer, WIDTH));
+        const int lastX = min(clip.x + clip.width, lowerBound(int64_t(cx) + outer + 1, WIDTH));
+        const int firstY = max(clip.y, lowerBound(int64_t(cy) - outer, HEIGHT));
+        const int lastY = min(clip.y + clip.height, lowerBound(int64_t(cy) + outer + 1, HEIGHT));
+        for (int y = firstY; y < lastY; ++y)
+        {
+            const int64_t dy = int64_t(y) - cy;
+            for (int x = firstX; x < lastX; ++x)
+            {
+                const int64_t dx = int64_t(x) - cx;
+                const int64_t squared = dx * dx + dy * dy;
+                if (squared <= outer * outer && squared >= inner * inner)
+                    setPixelValue(x, y, color, alpha);
+            }
         }
     }
 
@@ -422,52 +459,20 @@ public:
                    uint16_t color,
                    float    alpha = 1.0f)
     {
-        if (w <= 0 || h <= 0)
+        const auto clip = getClipRect();
+        if (w <= 0 || h <= 0 || !(alpha > 0))
             return;
-
-        if (solid)
-        {
-            for (int j = 0; j < h; j++)
-                for (int i = 0; i < w; i++)
-                    setPixelValue(x + i,
-                                  y + j,
-                                  color,
-                                  alpha);
-            return;
-        }
-
-        // Outline path: clamp thickness to [1, half the smaller dimension]
-        int max_thick = min(w / 2, h / 2);
-        thickness     = max(1, min(thickness, max_thick));
-
-        for(int t = 0; t < thickness; t++)
-        {
-            for(int i = 0; i < w; i++)
-            {
-                setPixelValue(x + i,
-                              y + t,
-                              color,
-                              alpha);
-                setPixelValue(x + i,
-                              y + h - 1 - t,
-                              color,
-                              alpha);
-            }
-        }
-        for(int t = 0; t < thickness; t++)
-        {
-            for(int j = 0; j < h; j++)
-            {
-                setPixelValue(x + t,
-                              y + j,
-                              color,
-                              alpha);
-                setPixelValue(x + w - 1 - t,
-                              y + j,
-                              color,
-                              alpha);
-            }
-        }
+        const int64_t right = int64_t(x) + w, bottom = int64_t(y) + h;
+        const int border = max(1, min(thickness, min(w / 2, h / 2)));
+        const int firstX = max(clip.x, lowerBound(x, WIDTH));
+        const int lastX = min(clip.x + clip.width, lowerBound(right, WIDTH));
+        const int firstY = max(clip.y, lowerBound(y, HEIGHT));
+        const int lastY = min(clip.y + clip.height, lowerBound(bottom, HEIGHT));
+        for (int row = firstY; row < lastY; ++row)
+            for (int col = firstX; col < lastX; ++col)
+                if (solid || int64_t(col) - x < border || right - col <= border ||
+                    int64_t(row) - y < border || bottom - row <= border)
+                    setPixelValue(col, row, color, alpha);
     }
 
     /**
@@ -491,23 +496,33 @@ public:
                        uint16_t color,
                        float    alpha = 1.0f)
     {
-        int minX = min(x0, min(x1, x2));
-        int maxX = max(x0, max(x1, x2));
-        int minY = min(y0, min(y1, y2));
-        int maxY = max(y0, max(y1, y2));
-
-        for (int y = minY; y <= maxY; y++)
-            for (int x = minX; x <= maxX; x++)
+        const auto clip = getClipRect();
+        const int minX = max(clip.x, min(x0, min(x1, x2)));
+        const int maxX = min(clip.x + clip.width - 1, max(x0, max(x1, x2)));
+        const int minY = max(clip.y, min(y0, min(y1, y2)));
+        const int maxY = min(clip.y + clip.height - 1, max(y0, max(y1, y2)));
+        if (minX > maxX || minY > maxY || !(alpha > 0))
+            return;
+        const auto edge = [](int ax, int ay, int bx, int by, int px, int py) {
+            return (double(bx) - ax) * (double(py) - ay) - (double(by) - ay) * (double(px) - ax);
+        };
+        if (edge(x0, y0, x1, y1, x2, y2) == 0)
+        {
+            draw_line_from_points(min(x0, min(x1, x2)), x0 == x1 && x1 == x2 ? min(y0, min(y1, y2)) :
+                                  (x0 <= x1 && x0 <= x2 ? y0 : (x1 <= x2 ? y1 : y2)),
+                                  max(x0, max(x1, x2)), x0 == x1 && x1 == x2 ? max(y0, max(y1, y2)) :
+                                  (x0 >= x1 && x0 >= x2 ? y0 : (x1 >= x2 ? y1 : y2)),
+                                  1, false, color, alpha);
+            return;
+        }
+        for (int y = minY; y <= maxY; ++y)
+            for (int x = minX; x <= maxX; ++x)
             {
-                int w0 = ((x1 - x0) * (y - y0)) - ((y1 - y0) * (x - x0));
-                int w1 = ((x2 - x1) * (y - y1)) - ((y2 - y1) * (x - x1));
-                int w2 = ((x0 - x2) * (y - y2)) - ((y0 - y2) * (x - x2));
-
-                if (((w0 >= 0) && (w1 >= 0) && (w2 >= 0)) || ((w0 <= 0) && (w1 <= 0) && (w2 <= 0)))
-                    setPixelValue(x,
-                                  y,
-                                  color,
-                                  alpha);
+                const double a = edge(x0, y0, x1, y1, x, y);
+                const double b = edge(x1, y1, x2, y2, x, y);
+                const double c = edge(x2, y2, x0, y0, x, y);
+                if ((a >= 0 && b >= 0 && c >= 0) || (a <= 0 && b <= 0 && c <= 0))
+                    setPixelValue(x, y, color, alpha);
             }
     }
 
@@ -538,99 +553,17 @@ public:
                            uint16_t color,
                            float    alpha = 1.0f)
     {
-        float x0 = x;
-        float y0 = y;
-        float x1 = x + w;
-        float y1 = y;
-        float x2 = x + w;
-        float y2 = y + h;
-        float x3 = x;
-        float y3 = y + h;
-
-        float rx0;
-        float ry0;
-        float rx1;
-        float ry1;
-        float rx2;
-        float ry2;
-        float rx3;
-        float ry3;
-
-        rotate_point(x0, y0, pivot_x, pivot_y, angle_deg, rx0, ry0);
-        rotate_point(x1, y1, pivot_x, pivot_y, angle_deg, rx1, ry1);
-        rotate_point(x2, y2, pivot_x, pivot_y, angle_deg, rx2, ry2);
-        rotate_point(x3, y3, pivot_x, pivot_y, angle_deg, rx3, ry3);
-
-        if (solid)
+        if (!(w > 0.0f) || !(h > 0.0f))
+            return;
+        float vertices[] = {x, y, x + w, y, x + w, y + h, x, y + h};
+        const float sine = sinf(angle_deg * DEG_TO_RAD), cosine = cosf(angle_deg * DEG_TO_RAD);
+        for (int i = 0; i < 8; i += 2)
         {
-            fill_triangle((int)(rx0 + 0.5f),
-                          (int)(ry0 + 0.5f),
-                          (int)(rx1 + 0.5f),
-                          (int)(ry1 + 0.5f),
-                          (int)(rx2 + 0.5f),
-                          (int)(ry2 + 0.5f),
-                          color,
-                          alpha);
-
-            fill_triangle((int)(rx0 + 0.5f),
-                          (int)(ry0 + 0.5f),
-                          (int)(rx2 + 0.5f),
-                          (int)(ry2 + 0.5f),
-                          (int)(rx3 + 0.5f),
-                          (int)(ry3 + 0.5f),
-                          color,
-                          alpha);
+            const float dx = vertices[i] - pivot_x, dy = vertices[i + 1] - pivot_y;
+            vertices[i] = pivot_x + dx * cosine - dy * sine;
+            vertices[i + 1] = pivot_y + dx * sine + dy * cosine;
         }
-        else
-        {
-            auto draw_edge = [&](float xs,
-                                 float ys,
-                                 float xe,
-                                 float ye)
-            {
-                float dx  = xe - xs;
-                float dy  = ye - ys;
-                float len = sqrtf((dx * dx) + (dy * dy));
-
-                if (len == 0)
-                    return;
-
-                float px = -(dy / len) * (thickness / 2.0f);
-                float py =  (dx / len) * (thickness / 2.0f);
-
-                float vx0 = xs + px;
-                float vy0 = ys + py;
-                float vx1 = xs - px;
-                float vy1 = ys - py;
-                float vx2 = xe + px;
-                float vy2 = ye + py;
-                float vx3 = xe - px;
-                float vy3 = ye - py;
-
-                fill_triangle((int)roundf(vx0),
-                              (int)roundf(vy0),
-                              (int)roundf(vx1),
-                              (int)roundf(vy1),
-                              (int)roundf(vx2),
-                              (int)roundf(vy2),
-                              color,
-                              alpha);
-
-                fill_triangle((int)roundf(vx1),
-                              (int)roundf(vy1),
-                              (int)roundf(vx3),
-                              (int)roundf(vy3),
-                              (int)roundf(vx2),
-                              (int)roundf(vy2),
-                              color,
-                              alpha);
-            };
-
-            draw_edge(rx0, ry0, rx1, ry1);
-            draw_edge(rx1, ry1, rx2, ry2);
-            draw_edge(rx2, ry2, rx3, ry3);
-            draw_edge(rx3, ry3, rx0, ry0);
-        }
+        draw_polygon(vertices, 4, thickness, solid, color, alpha);
     }
 
     /**
@@ -658,104 +591,95 @@ public:
                   float    start_deg,
                   float    end_deg,
                   uint16_t color,
-                  float    alpha = 1.0f)
+                  float    alpha = 1.0f,
+                  Antialiasing antialias = Antialiasing::OFF)
     {
-        if (radius <= 0)
+        const auto clip = getClipRect();
+        if (radius <= 0 || !isfinite(start_deg) || !isfinite(end_deg) || !(alpha > 0))
             return;
-
-        // Allow end_deg < start_deg by wrapping forward
-        while (end_deg < start_deg)
-            end_deg += 360.0f;
-
-        float span    = end_deg - start_deg;
-        int   r_outer = radius;
-        int   r_inner = solid ? 0 : max(0, radius - max(1, thickness));
-
-        for (int y = -r_outer; y <= r_outer; y++)
+        const double difference = double(end_deg) - start_deg;
+        if (difference >= 360.0 || difference <= -360.0)
         {
-            for (int x = -r_outer; x <= r_outer; x++)
+            draw_circle(cx, cy, radius, thickness, solid, color, alpha, antialias);
+            return;
+        }
+        const float span = difference < 0 ? difference + 360.0 : difference;
+        const float start = fmodf(start_deg, 360.0f);
+        const int64_t outer = radius;
+        const int64_t inner = solid ? 0 : max(0, radius - max(1, thickness));
+        if (antialias == Antialiasing::COVERAGE && alpha > 0)
+        {
+            Paint paint{*this, color, min(1.0f, alpha)};
+            pixelplanner_detail::radialPath(cx, cy, radius, int(inner), start, span,
+                                           clip, &paint, Paint::put);
+            return;
+        }
+        const int firstX = max(clip.x, lowerBound(int64_t(cx) - outer, WIDTH));
+        const int lastX = min(clip.x + clip.width, lowerBound(int64_t(cx) + outer + 1, WIDTH));
+        const int firstY = max(clip.y, lowerBound(int64_t(cy) - outer, HEIGHT));
+        const int lastY = min(clip.y + clip.height, lowerBound(int64_t(cy) + outer + 1, HEIGHT));
+        for (int y = firstY; y < lastY; ++y)
+        {
+            const int64_t dy = int64_t(y) - cy;
+            for (int x = firstX; x < lastX; ++x)
             {
-                int r2 = (x * x) + (y * y);
-
-                if (r2 > (r_outer * r_outer))
+                const int64_t dx = int64_t(x) - cx;
+                const int64_t squared = dx * dx + dy * dy;
+                if (squared > outer * outer || squared < inner * inner)
                     continue;
-
-                if (!solid && (r2 < (r_inner * r_inner)))
-                    continue;
-
-                // Sample four sub-pixel corners and accept the pixel if any
-                // corner falls within the arc. This prevents gaps on thin arcs
-                // where a single centre-point atan2 test misses boundary pixels.
-                bool inside = false;
-
-                for (int sy = 0; (sy < 2) && !inside; sy++)
-                {
-                    for (int sx = 0; (sx < 2) && !inside; sx++)
+                bool inside = squared == 0;
+                for (int sy = 0; sy < 2 && !inside; ++sy)
+                    for (int sx = 0; sx < 2 && !inside; ++sx)
                     {
-                        float fx = (float)x + (sx ? 0.5f : -0.5f);
-                        float fy = (float)y + (sy ? 0.5f : -0.5f);
-
-                        float angle = atan2f(fy, fx) * (180.0f / (float)M_PI);
-
-                        while (angle <  start_deg)          angle += 360.0f;
-                        while (angle >= start_deg + 360.0f) angle -= 360.0f;
-
-                        if (angle <= start_deg + span)
-                            inside = true;
+                        const float angle = atan2f(dy + (sy ? 0.5f : -0.5f),
+                                                   dx + (sx ? 0.5f : -0.5f)) / DEG_TO_RAD;
+                        const float relative = fmodf(angle - start + 720.0f, 360.0f);
+                        inside = relative <= span;
                     }
-                }
-
                 if (inside)
-                    setPixelValue(cx + x,
-                                  cy + y,
-                                  color,
-                                  alpha);
+                    setPixelValue(x, y, color, alpha);
             }
         }
     }
 
     /**
-     * @brief Draw an open polyline through an ordered list of points.
+     * @brief Stroke an open or closed path, blending each covered pixel once.
      *
-     * Draws connected line segments between consecutive vertices. The path
-     * is not closed; use draw_polygon with solid=false to close the shape.
-     *
-     * @param points    Flat array of vertex coordinates [x0,y0, x1,y1, ...].
-     * @param count     Number of vertices (not the number of floats).
-     * @param thickness Line thickness in pixels.
-     * @param color     RGB565 color.
-     * @param alpha     Blend factor [0.0–1.0].
+     * points contains x/y pairs in pixmap coordinates. count is the number of
+     * vertices. Caps apply only to open paths.
      */
+    void strokePath(const float* points, size_t count, bool closed, const StrokeStyle& style,
+                    uint16_t color, float alpha = 1.0f)
+    {
+        const auto clip = getClipRect();
+        if (!(alpha > 0) || !clip.width || !clip.height)
+            return;
+        Paint paint{*this, color, min(1.0f, alpha)};
+        pixelplanner_detail::strokePath(points, count, closed, style, clip, &paint, Paint::put);
+    }
+
+    // Convenience for an open path with square caps and miter joins.
     void draw_polyline(const float* points,
                        size_t       count,
                        float        thickness,
                        uint16_t     color,
                        float        alpha = 1.0f)
     {
-        if (!points || (count < 2))
+        if (count < 2 || !isfinite(thickness))
             return;
-
-        for (size_t i = 0; i < count - 1; i++)
-            draw_line_from_points(points[(i * 2) + 0],
-                                  points[(i * 2) + 1],
-                                  points[(i * 2) + 2],
-                                  points[(i * 2) + 3],
-                                  thickness,
-                                  false,
-                                  color,
-                                  alpha);
+        StrokeStyle style;
+        style.width = max(1.0f, thickness);
+        style.cap = StrokeCap::SQUARE;
+        strokePath(points, count, false, style, color, alpha);
     }
 
     /**
      * @brief Draw a polygon (filled or outlined) through an ordered list of vertices.
      *
      * Filled mode uses a scanline even-odd rasterizer and correctly handles both
-     * convex and simple concave polygons. Outlined mode draws each edge as a
-     * thick line and closes the last vertex back to the first.
+     * convex and concave polygons. Outlined mode strokes a closed path.
      *
-     * The intersection scratch buffer is capped at 64 entries per scanline, which
-     * is sufficient for typical use. Increase @c MAX_INTERSECTIONS for highly
-     * complex shapes.
+     * Polygons with more than 64 vertices use heap scratch space.
      *
      * @param points    Flat array of vertex coordinates [x0,y0, x1,y1, ...].
      * @param count     Number of vertices (not the number of floats).
@@ -769,109 +693,94 @@ public:
                       float        thickness,
                       bool         solid,
                       uint16_t     color,
-                      float        alpha = 1.0f)
+                      float        alpha = 1.0f,
+                      Antialiasing antialias = Antialiasing::OFF)
     {
-        if (!points || (count < 3))
+        const auto clip = getClipRect();
+        if (!points || count < 3 || count > SIZE_MAX / 2 || !(alpha > 0))
             return;
-
         if (!solid)
         {
-            for (size_t i = 0; i < count; i++)
-            {
-                size_t j = (i + 1) % count;
-
-                draw_line_from_points(points[(i * 2) + 0],
-                                      points[(i * 2) + 1],
-                                      points[(j * 2) + 0],
-                                      points[(j * 2) + 1],
-                                      thickness,
-                                      false,
-                                      color,
-                                      alpha);
-            }
+            if (!isfinite(thickness))
+                return;
+            StrokeStyle style;
+            style.width = max(1.0f, thickness);
+            style.antialias = antialias;
+            strokePath(points, count, true, style, color, alpha);
             return;
         }
-
-        // Compute vertical extents
-        float minY =  1e9f;
-        float maxY = -1e9f;
-
-        for (size_t i = 0; i < count; i++)
+        if (antialias == Antialiasing::COVERAGE)
         {
-            float fy = points[(i * 2) + 1];
-
-            if (fy < minY) minY = fy;
-            if (fy > maxY) maxY = fy;
+            Paint paint{*this, color, min(1.0f, alpha)};
+            pixelplanner_detail::fillPath(points, count, clip, &paint, Paint::put);
+            return;
         }
+        for (size_t i = 0; i < count * 2; ++i)
+            if (!isfinite(points[i]))
+                return;
 
-        int scanY0 = max(0,                (int)floorf(minY));
-        int scanY1 = min((int)height() - 1, (int)ceilf(maxY));
+        float minY = points[1], maxY = points[1];
+        for (size_t i = 1; i < count; ++i)
+        {
+            minY = min(minY, points[2 * i + 1]);
+            maxY = max(maxY, points[2 * i + 1]);
+        }
+        const auto pixelBound = [](float edge, size_t extent) {
+            const float pixel = ceilf(edge - 0.5f);
+            return pixel <= 0.0f ? 0 : double(pixel) >= double(extent) ? int(extent) : int(pixel);
+        };
+        const int firstRow = max(clip.y, pixelBound(minY, HEIGHT));
+        const int lastRow = min(clip.y + clip.height, pixelBound(maxY, HEIGHT));
+        if (firstRow >= lastRow || count > SIZE_MAX / sizeof(float))
+            return;
 
-        static const size_t MAX_INTERSECTIONS = 64;
-
-        float xs[MAX_INTERSECTIONS];
-
-        for (int scanY = scanY0; scanY <= scanY1; scanY++)
+        constexpr size_t localCapacity = 64;
+        float local[localCapacity];
+        float* intersections = count <= localCapacity ? local : static_cast<float*>(malloc(count * sizeof(float)));
+        if (!intersections)
+            return;
+        for (int row = firstRow; row < lastRow; ++row)
         {
             size_t hits = 0;
-            float  fy   = (float)scanY + 0.5f; // sample at pixel centre
-
-            for (size_t i = 0; (i < count) && (hits < MAX_INTERSECTIONS); i++)
+            const double y = row + 0.5;
+            for (size_t i = 0; i < count; ++i)
             {
-                size_t j  = (i + 1) % count;
-                float  ay = points[(i * 2) + 1];
-                float  by = points[(j * 2) + 1];
-
-                if (((ay <= fy) && (by > fy)) || ((by <= fy) && (ay > fy)))
+                const size_t j = (i + 1) % count;
+                const float ay = points[2 * i + 1], by = points[2 * j + 1];
+                if ((ay <= y && by > y) || (by <= y && ay > y))
                 {
-                    float ax = points[(i * 2) + 0];
-                    float bx = points[(j * 2) + 0];
-                    float t  = (fy - ay) / (by - ay);
-
-                    xs[hits++] = ax + (t * (bx - ax));
+                    const double fraction = (y - ay) / (double(by) - ay);
+                    intersections[hits++] = (1 - fraction) * points[2 * i] + fraction * points[2 * j];
                 }
             }
 
-            // Insertion sort — N is small
-            for (size_t a = 1; a < hits; a++)
+            for (size_t i = 1; i < hits; ++i)
             {
-                float key = xs[a];
-                int   b   = (int)a - 1;
-
-                while ((b >= 0) && (xs[b] > key))
+                const float value = intersections[i];
+                size_t j = i;
+                while (j > 0 && intersections[j - 1] > value)
                 {
-                    xs[b + 1] = xs[b];
-                    b--;
+                    intersections[j] = intersections[j - 1];
+                    --j;
                 }
-
-                xs[b + 1] = key;
+                intersections[j] = value;
             }
-
-            // Fill between each pair of intersections
-            for (size_t a = 0; (a + 1) < hits; a += 2)
+            for (size_t i = 0; i + 1 < hits; i += 2)
             {
-                int xLeft  = max(0,                (int)ceilf (xs[a]));
-                int xRight = min((int)width() - 1, (int)floorf(xs[a + 1]));
-
-                for (int px = xLeft; px <= xRight; px++)
-                    setPixelValue(px,
-                                  scanY,
-                                  color,
-                                  alpha);
+                const int end = min(clip.x + clip.width, pixelBound(intersections[i + 1], WIDTH));
+                for (int x = max(clip.x, pixelBound(intersections[i], WIDTH)); x < end; ++x)
+                    setPixelValue(x, row, color, alpha);
             }
         }
+        if (intersections != local)
+            free(intersections);
     }
 
     /**
      * @brief Flood fill a contiguous region starting from a seed pixel.
      *
      * Replaces all pixels connected to the seed that share its color with
-     * @p fill_color. Uses an iterative scanline algorithm to avoid deep
-     * recursion on embedded targets.
-     *
-     * Stack memory is allocated on the heap (@c new / @c delete). If your
-     * environment uses a custom allocator or has no heap, replace the
-     * allocation with a statically sized array sized to WIDTH * HEIGHT.
+     * @p fill_color. Uses a bounded heap queue to avoid recursion.
      *
      * @param x          Seed X coordinate.
      * @param y          Seed Y coordinate.
@@ -883,57 +792,54 @@ public:
                     uint16_t fill_color,
                     float    alpha = 1.0f)
     {
-        if (!inBounds(x, y))
+        const auto clip = getClipRect();
+        if (!inClip(x, y) || !(alpha > 0))
             return;
-
-        uint16_t target = getPixelValue(x, y);
-
-        if (target == fill_color)
+        const size_t seed = index(x, y);
+        const uint16_t target = pixels[seed];
+        const uint16_t replacement = blend565(target, fill_color, alpha);
+        constexpr size_t count = WIDTH * HEIGHT;
+        using QueueIndex = size_t;
+        const size_t capacity = size_t(clip.width) * clip.height;
+        if (capacity > SIZE_MAX / sizeof(QueueIndex))
             return;
-
-        struct Point { int16_t x; int16_t y; };
-
-        const int max_stack = (int)(WIDTH * HEIGHT);
-        Point*    stack     = new Point[max_stack];
-
-        if (!stack)
-            return;
-
-        int top      = 0;
-        stack[top++] = { (int16_t)x, (int16_t)y };
-
-        while (top > 0)
+        auto* queue = static_cast<QueueIndex*>(malloc(capacity * sizeof(QueueIndex)));
+        const bool needsVisited = COVERAGE || replacement == target;
+        auto* visited = needsVisited ? static_cast<uint8_t*>(calloc(count / 8 + 1, 1)) : nullptr;
+        if (!queue || (needsVisited && !visited))
         {
-            Point p  = stack[--top];
-            int   cx = p.x;
-            int   cy = p.y;
-
-            if (!inBounds(cx, cy))
-                continue;
-
-            if (getPixelValue(cx, cy) != target)
-                continue;
-
-            // Extend to the leftmost and rightmost matching pixel on this scanline
-            int left  = cx;
-            int right = cx;
-
-            while ((left  > 0)               && (getPixelValue(left  - 1, cy) == target)) left--;
-            while ((right < (int)width() - 1) && (getPixelValue(right + 1, cy) == target)) right++;
-
-            for (int px = left; px <= right; px++)
-            {
-                setPixelValue(px, cy, fill_color, alpha);
-
-                if ((cy > 0)                && (getPixelValue(px, cy - 1) == target) && (top < max_stack))
-                    stack[top++] = { (int16_t)px, (int16_t)(cy - 1) };
-
-                if ((cy < (int)height() - 1) && (getPixelValue(px, cy + 1) == target) && (top < max_stack))
-                    stack[top++] = { (int16_t)px, (int16_t)(cy + 1) };
-            }
+            free(queue);
+            free(visited);
+            return;
         }
 
-        delete[] stack;
+        size_t head = 0, tail = 0;
+        const auto visit = [&](size_t offset) {
+            if (pixels[offset] != target)
+                return;
+            if (visited)
+            {
+                const uint8_t bit = uint8_t(1u << (offset % 8));
+                if (visited[offset / 8] & bit)
+                    return;
+                visited[offset / 8] |= bit;
+            }
+            composite(offset, fill_color, alpha);
+            queue[tail++] = offset;
+        };
+        visit(seed);
+        while (head < tail)
+        {
+            const size_t offset = queue[head++];
+            const size_t column = offset % WIDTH;
+            const size_t row = offset / WIDTH;
+            if (column > size_t(clip.x)) visit(offset - 1);
+            if (column + 1 < size_t(clip.x + clip.width)) visit(offset + 1);
+            if (row > size_t(clip.y)) visit(offset - WIDTH);
+            if (row + 1 < size_t(clip.y + clip.height)) visit(offset + WIDTH);
+        }
+        free(visited);
+        free(queue);
     }
 
     /**
@@ -950,413 +856,519 @@ public:
      * @param scaleMode Interpolation algorithm.
      * @param alpha     Blend factor [0.0–1.0].
      */
-    template <size_t W2, size_t H2>
-    void blit_from_pixmap(const Pixmap<W2, H2>& src,
-                          BlitMode              mode      = BlitMode::TOP_LEFT,
-                          ScaleMode             scaleMode = ScaleMode::NEAREST,
-                          float                 alpha     = 1.0f)
+    template <size_t W2, size_t H2, bool SOURCE_COVERAGE>
+    void blit_from_pixmap(const Pixmap<W2, H2, SOURCE_COVERAGE>& src,
+                          BlitMode mode = BlitMode::TOP_LEFT,
+                          ScaleMode scaleMode = ScaleMode::NEAREST,
+                          float alpha = 1.0f,
+                          int destX = 0, int destY = 0, int destW = -1, int destH = -1)
     {
-        const uint16_t* src_pixels = src.getPixels();
-        const bool*     src_mask   = src.getMask();
-
-        // Determine destination drawing area and offsets (mirrors blitFromArray logic)
-        float drawW   = (float)W2;
-        float drawH   = (float)H2;
-        float offsetX = 0.0f;
-        float offsetY = 0.0f;
-
-        if (mode == BlitMode::STRETCH)
-        {
-            drawW = (float)width();
-            drawH = (float)height();
-        }
-        else if ((mode == BlitMode::FIT) || (mode == BlitMode::FILL))
-        {
-            float sx = (float)width()  / W2;
-            float sy = (float)height() / H2;
-            float s  = (mode == BlitMode::FIT) ? min(sx, sy) : max(sx, sy);
-
-            drawW = W2 * s;
-            drawH = H2 * s;
-
-            offsetX = (width()  - drawW) * 0.5f;
-            offsetY = (height() - drawH) * 0.5f;
-        }
-        else if (mode == BlitMode::CENTER)
-        {
-            offsetX = (width()  - W2) * 0.5f;
-            offsetY = (height() - H2) * 0.5f;
-        }
-        else if (mode == BlitMode::TOP_RIGHT)
-        {
-            offsetX = width() - W2;
-            offsetY = 0;
-        }
-        else if (mode == BlitMode::BOTTOM_LEFT)
-        {
-            offsetX = 0;
-            offsetY = height() - H2;
-        }
-        else if (mode == BlitMode::BOTTOM_RIGHT)
-        {
-            offsetX = width() - W2;
-            offsetY = height() - H2;
-        }
-        // TOP_LEFT: offsetX = offsetY = 0
-
-        float scaleX = (drawW > 1) ? (W2 - 1) / (drawW - 1) : 0.0f;
-        float scaleY = (drawH > 1) ? (H2 - 1) / (drawH - 1) : 0.0f;
-
-        for (int y = 0; y < (int)height(); y++)
-        {
-            for (int x = 0; x < (int)width(); x++)
-            {
-                float srcXf = (x - offsetX) * scaleX;
-                float srcYf = (y - offsetY) * scaleY;
-
-                uint16_t c        = 0;
-                bool     src_set  = false;
-
-                if (scaleMode == ScaleMode::NEAREST)
-                {
-                    int xi = (int)roundf(srcXf);
-                    int yi = (int)roundf(srcYf);
-
-                    if ((xi >= 0) && (xi < (int)W2) && (yi >= 0) && (yi < (int)H2))
-                    {
-                        src_set = src_mask[(yi * W2) + xi];
-                        c       = src_pixels[(yi * W2) + xi];
-                    }
-                }
-                else if (scaleMode == ScaleMode::BILINEAR)
-                {
-                    int x0 = (int)floorf(srcXf);
-                    int y0 = (int)floorf(srcYf);
-                    int x1 = min(x0 + 1, (int)W2 - 1);
-                    int y1 = min(y0 + 1, (int)H2 - 1);
-
-                    if ((x0 >= 0) && (x0 < (int)W2) && (y0 >= 0) && (y0 < (int)H2))
-                    {
-                        float fx = srcXf - x0;
-                        float fy = srcYf - y0;
-
-                        // Treat the pixel as set if any of the four samples are masked
-                        src_set = src_mask[(y0 * W2) + x0] ||
-                                  src_mask[(y0 * W2) + x1] ||
-                                  src_mask[(y1 * W2) + x0] ||
-                                  src_mask[(y1 * W2) + x1];
-
-                        uint16_t c00 = src_pixels[(y0 * W2) + x0];
-                        uint16_t c10 = src_pixels[(y0 * W2) + x1];
-                        uint16_t c01 = src_pixels[(y1 * W2) + x0];
-                        uint16_t c11 = src_pixels[(y1 * W2) + x1];
-
-                        auto lerp565 = [](uint16_t a, uint16_t b, float t) -> uint16_t
-                        {
-                            int ar = (a >> 11) & 0x1F;
-                            int ag = (a >> 5)  & 0x3F;
-                            int ab =  a        & 0x1F;
-                            int br = (b >> 11) & 0x1F;
-                            int bg = (b >> 5)  & 0x3F;
-                            int bb =  b        & 0x1F;
-
-                            return (uint16_t)(((ar + (int)((br - ar) * t)) << 11) |
-                                             ((ag + (int)((bg - ag) * t)) << 5)  |
-                                              (ab + (int)((bb - ab) * t)));
-                        };
-
-                        c = lerp565(lerp565(c00, c10, fx),
-                                    lerp565(c01, c11, fx),
-                                    fy);
-                    }
-                }
-                else if (scaleMode == ScaleMode::AREA)
-                {
-                    float ax0 = srcXf;
-                    float ay0 = srcYf;
-                    float ax1 = srcXf + scaleX;
-                    float ay1 = srcYf + scaleY;
-
-                    float r     = 0.0f;
-                    float g     = 0.0f;
-                    float b     = 0.0f;
-                    float total = 0.0f;
-
-                    int ix0 = (int)floorf(ax0);
-                    int iy0 = (int)floorf(ay0);
-                    int ix1 = (int)ceilf(ax1);
-                    int iy1 = (int)ceilf(ay1);
-
-                    for (int sy = iy0; sy < iy1; sy++)
-                    {
-                        if ((sy < 0) || (sy >= (int)H2))
-                            continue;
-
-                        float wy = min(ay1, (float)(sy + 1)) - max(ay0, (float)sy);
-
-                        if (wy <= 0.0f)
-                            continue;
-
-                        for (int sx = ix0; sx < ix1; sx++)
-                        {
-                            if ((sx < 0) || (sx >= (int)W2))
-                                continue;
-
-                            float wx = min(ax1, (float)(sx + 1)) - max(ax0, (float)sx);
-
-                            if (wx <= 0.0f)
-                                continue;
-
-                            float    w   = wx * wy;
-                            uint16_t pix = src_pixels[(sy * W2) + sx];
-
-                            if (src_mask[(sy * W2) + sx])
-                                src_set = true;
-
-                            r     += ((pix >> 11) & 0x1F) * w;
-                            g     += ((pix >> 5)  & 0x3F) * w;
-                            b     +=  (pix        & 0x1F) * w;
-                            total +=   w;
-                        }
-                    }
-
-                    if (total > 0.0f)
-                    {
-                        r /= total;
-                        g /= total;
-                        b /= total;
-                    }
-
-                    c = ((int)r << 11) | ((int)g << 5) | (int)b;
-                }
-
-                if (src_set)
-                    setPixelValue(x,
-                                  y,
-                                  c,
-                                  alpha);
-            }
-        }
+        if (static_cast<const void*>(this) == static_cast<const void*>(&src))
+            return;
+        blit(W2, H2, mode, scaleMode, alpha, destX, destY, destW, destH,
+             [&](size_t i) { return samplePixmap(src, i); });
     }
 
-    void blitFromArray(const uint16_t* src,
-                       size_t srcW,
-                       size_t srcH,
-                       BlitMode mode,
-                       ScaleMode scaleMode = ScaleMode::BILINEAR,
-                       float alpha = 1.0f,
-                       int destX = 0,
-                       int destY = 0,
-                       int destW = -1,
-                       int destH = -1)
+    // Scale the original pixmap directly into a destination rectangle.
+    template <size_t W2, size_t H2, bool SOURCE_COVERAGE>
+    void blitResized(const Pixmap<W2, H2, SOURCE_COVERAGE>& src, int x, int y, int w, int h,
+                     ScaleMode scaleMode = ScaleMode::NEAREST, float alpha = 1.0f)
     {
-        if (!src || (srcW == 0) || (srcH == 0))
+        if (w > 0 && h > 0)
+            blit_from_pixmap(src, BlitMode::STRETCH, scaleMode, alpha, x, y, w, h);
+    }
+
+    // Drawing coordinates are in the original layout. Geometry is rasterized
+    // at the destination size, preserving aspect ratio.
+    class ScaledDrawing
+    {
+        friend class Pixmap;
+
+        ScaledDrawing(Pixmap& target, int sourceWidth, int sourceHeight)
+            : _target(target),
+              _scale(min(float(WIDTH) / sourceWidth, float(HEIGHT) / sourceHeight)),
+              _left((WIDTH - sourceWidth * _scale) * 0.5f),
+              _top((HEIGHT - sourceHeight * _scale) * 0.5f)
+        {
+        }
+
+    public:
+        // Map pixel centers for use with other Pixmap drawing operations.
+        float mapX(float x) const { return _left + (x + 0.5f) * _scale - 0.5f; }
+        float mapY(float y) const { return _top + (y + 0.5f) * _scale - 0.5f; }
+        float mapLength(float length) const { return length * _scale; }
+        Pixmap& target() const { return _target; }
+
+        void draw_rect(int x, int y, int w, int h, int thickness, bool solid,
+                       uint16_t color, float alpha = 1.0f)
+        {
+            if (w <= 0 || h <= 0)
+                return;
+            const float left = _left + x * _scale;
+            const float top = _top + y * _scale;
+            const int x0 = rounded(left), y0 = rounded(top);
+            const int x1 = rounded(left + w * _scale), y1 = rounded(top + h * _scale);
+            _target.draw_rect(x0, y0, int(min(int64_t(INT_MAX), int64_t(x1) - x0)),
+                              int(min(int64_t(INT_MAX), int64_t(y1) - y0)),
+                              rounded(mapLength(thickness)), solid, color, alpha);
+        }
+
+        void draw_circle(int x, int y, int radius, int thickness, bool solid,
+                         uint16_t color, float alpha = 1.0f,
+                         Antialiasing antialias = Antialiasing::OFF)
+        {
+            _target.draw_circle(rounded(mapX(x)), rounded(mapY(y)), rounded(mapLength(radius)),
+                                rounded(mapLength(thickness)), solid, color, alpha, antialias);
+        }
+
+        void draw_arc(int x, int y, int radius, int thickness, bool solid, float start, float end,
+                      uint16_t color, float alpha = 1.0f,
+                      Antialiasing antialias = Antialiasing::OFF)
+        {
+            _target.draw_arc(rounded(mapX(x)), rounded(mapY(y)), rounded(mapLength(radius)),
+                             rounded(mapLength(thickness)), solid, start, end, color, alpha, antialias);
+        }
+
+        void draw_line_from_points(float x1, float y1, float x2, float y2, float thickness,
+                                   bool border_to_border, uint16_t color, float alpha = 1.0f)
+        {
+            _target.draw_line_from_points(mapX(x1), mapY(y1), mapX(x2), mapY(y2),
+                                          mapLength(thickness), border_to_border, color, alpha);
+        }
+
+    private:
+        static int rounded(float value)
+        {
+            const double integer = roundf(value);
+            return integer >= INT_MAX ? INT_MAX : integer <= INT_MIN ? INT_MIN : int(integer);
+        }
+
+        Pixmap& _target;
+        float _scale, _left, _top;
+    };
+
+    // Clear this pixmap and replay the original drawing at the new resolution.
+    template <typename Draw>
+    void redrawResized(int sourceWidth, int sourceHeight, Draw&& draw)
+    {
+        if (sourceWidth <= 0 || sourceHeight <= 0)
+            return;
+        clear();
+        ScaledDrawing canvas(*this, sourceWidth, sourceHeight);
+        draw(canvas);
+    }
+
+    void blitFromArray(const uint16_t* src, size_t srcW, size_t srcH,
+                       BlitMode mode, ScaleMode scaleMode = ScaleMode::BILINEAR,
+                       float alpha = 1.0f, int destX = 0, int destY = 0,
+                       int destW = -1, int destH = -1)
+    {
+        if (src)
+            blit(srcW, srcH, mode, scaleMode, alpha, destX, destY, destW, destH,
+                 [&](size_t i) { return Sample{pgm_read_word(src + i), 255}; });
+    }
+
+    void blitFromArray(const bool* src, size_t srcW, size_t srcH, uint16_t color,
+                       BlitMode mode, ScaleMode scaleMode = ScaleMode::BILINEAR,
+                       float alpha = 1.0f, int destX = 0, int destY = 0,
+                       int destW = -1, int destH = -1)
+    {
+        if (src)
+            blit(srcW, srcH, mode, scaleMode, alpha, destX, destY, destW, destH,
+                 [&](size_t i) { return Sample{color, uint8_t(pgm_read_byte(src + i) ? 255 : 0)}; });
+    }
+
+    // Draw a rectangular sprite from a larger asset. The source must lie within the image.
+    template <size_t W2, size_t H2, bool SOURCE_COVERAGE>
+    void blitRegion(const Pixmap<W2, H2, SOURCE_COVERAGE>& src, PixmapRect source, PixmapRect destination,
+                    BlitMode mode = BlitMode::STRETCH, ScaleMode filter = ScaleMode::NEAREST,
+                    float alpha = 1.0f)
+    {
+        if (static_cast<const void*>(this) != static_cast<const void*>(&src))
+            drawRegion(W2, H2, source, destination, mode, filter, alpha,
+                       [&](size_t i) { return samplePixmap(src, i); });
+    }
+
+    void blitRegion(const uint16_t* src, size_t srcW, size_t srcH, PixmapRect source,
+                    PixmapRect destination, BlitMode mode = BlitMode::STRETCH,
+                    ScaleMode filter = ScaleMode::NEAREST, float alpha = 1.0f)
+    {
+        if (src && src != pixels)
+            drawRegion(srcW, srcH, source, destination, mode, filter, alpha,
+                       [&](size_t i) { return Sample{pgm_read_word(src + i), 255}; });
+    }
+
+    void blitRegion(const bool* src, size_t srcW, size_t srcH, uint16_t color, PixmapRect source,
+                    PixmapRect destination, BlitMode mode = BlitMode::STRETCH,
+                    ScaleMode filter = ScaleMode::NEAREST, float alpha = 1.0f)
+    {
+        if (src && src != mask)
+            drawRegion(srcW, srcH, source, destination, mode, filter, alpha,
+                       [&](size_t i) { return Sample{color, uint8_t(pgm_read_byte(src + i) ? 255 : 0)}; });
+    }
+
+    // Rotate and scale in a single draw using a pivot relative to the source region.
+    template <size_t W2, size_t H2, bool SOURCE_COVERAGE>
+    void blitTransformed(const Pixmap<W2, H2, SOURCE_COVERAGE>& src, PixmapRect source, const BlitTransform& transform,
+                         ScaleMode filter = ScaleMode::NEAREST, float alpha = 1.0f)
+    {
+        if (static_cast<const void*>(this) != static_cast<const void*>(&src))
+            drawTransformed(W2, H2, source, transform, filter, alpha,
+                            [&](size_t i) { return samplePixmap(src, i); });
+    }
+
+    void blitTransformed(const uint16_t* src, size_t srcW, size_t srcH, PixmapRect source,
+                         const BlitTransform& transform, ScaleMode filter = ScaleMode::NEAREST,
+                         float alpha = 1.0f)
+    {
+        if (src && src != pixels)
+            drawTransformed(srcW, srcH, source, transform, filter, alpha,
+                            [&](size_t i) { return Sample{pgm_read_word(src + i), 255}; });
+    }
+
+    void blitTransformed(const bool* src, size_t srcW, size_t srcH, uint16_t color, PixmapRect source,
+                         const BlitTransform& transform, ScaleMode filter = ScaleMode::NEAREST,
+                         float alpha = 1.0f)
+    {
+        if (src && src != mask)
+            drawTransformed(srcW, srcH, source, transform, filter, alpha,
+                            [&](size_t i) { return Sample{color, uint8_t(pgm_read_byte(src + i) ? 255 : 0)}; });
+    }
+
+private:
+    struct Sample { uint16_t color; uint8_t coverage; };
+
+    template <typename Source>
+    static Sample samplePixmap(const Source& src, size_t i)
+    {
+        const auto* alpha = src.getCoverage();
+        return {src.getPixels()[i], alpha ? alpha[i] : uint8_t(src.getMask()[i] ? 255 : 0)};
+    }
+
+    struct WeightedPixel
+    {
+        float red = 0, green = 0, blue = 0, coverage = 0;
+
+        void add(Sample sample, float weight)
+        {
+            if (!sample.coverage || weight <= 0.0f)
+                return;
+            if (sample.coverage != 255)
+                weight *= sample.coverage / 255.0f;
+            red += ((sample.color >> 11) & 31) * weight;
+            green += ((sample.color >> 5) & 63) * weight;
+            blue += (sample.color & 31) * weight;
+            coverage += weight;
+        }
+
+        uint16_t color() const
+        {
+            return (uint16_t(red / coverage + 0.5f) << 11) |
+                   (uint16_t(green / coverage + 0.5f) << 5) | uint16_t(blue / coverage + 0.5f);
+        }
+    };
+
+    static bool validRegion(size_t srcW, size_t srcH, const PixmapRect& region)
+    {
+        return srcW && srcH && srcW <= INT_MAX && srcH <= INT_MAX &&
+               srcW <= SIZE_MAX / srcH && region.x >= 0 && region.y >= 0 &&
+               region.width > 0 && region.height > 0 &&
+               int64_t(region.x) + region.width <= int64_t(srcW) &&
+               int64_t(region.y) + region.height <= int64_t(srcH);
+    }
+
+    template <typename Fetch>
+    void drawRegion(size_t srcW, size_t srcH, PixmapRect source, PixmapRect destination,
+                    BlitMode mode, ScaleMode filter, float alpha, Fetch fetch)
+    {
+        if (!validRegion(srcW, srcH, source) || destination.width <= 0 || destination.height <= 0)
+            return;
+        const size_t start = size_t(source.y) * srcW + source.x;
+        blit(source.width, source.height, mode, filter, alpha, destination.x, destination.y,
+             destination.width, destination.height, fetch, srcW, start);
+    }
+
+    template <typename At>
+    static WeightedPixel sampleBilinear(float u, float v, int width, int height, At at)
+    {
+        // Source coordinates are measured from the image edge, not the first center.
+        const float sx = max(0.0f, min(float(width - 1), u - 0.5f));
+        const float sy = max(0.0f, min(float(height - 1), v - 0.5f));
+        const int lx = int(sx), ly = int(sy);
+        const int rx = min(lx + 1, width - 1), ry = min(ly + 1, height - 1);
+        const float fx = sx - lx, fy = sy - ly;
+        WeightedPixel pixel;
+        pixel.add(at(lx, ly), (1 - fx) * (1 - fy));
+        pixel.add(at(rx, ly), fx * (1 - fy));
+        pixel.add(at(lx, ry), (1 - fx) * fy);
+        pixel.add(at(rx, ry), fx * fy);
+        return pixel;
+    }
+
+    static int clampEdge(float position, size_t extent)
+    {
+        return position <= 0.0f ? 0 : double(position) >= double(extent)
+            ? int(extent) : int(position);
+    }
+
+    template <typename Fetch>
+    void drawTransformed(size_t srcW, size_t srcH, PixmapRect source,
+                         const BlitTransform& transform, ScaleMode filter, float alpha, Fetch fetch)
+    {
+        const auto clip = getClipRect();
+        if (!validRegion(srcW, srcH, source) || !(alpha > 0) ||
+            !isfinite(transform.x) || !isfinite(transform.y) || !isfinite(transform.angle) ||
+            !isfinite(transform.pivotX) || !isfinite(transform.pivotY) ||
+            !isfinite(transform.scaleX) || !isfinite(transform.scaleY) ||
+            transform.scaleX == 0.0f || transform.scaleY == 0.0f)
             return;
 
-        int subW = (destW < 0) ? (int)width() - destX : destW;
-        int subH = (destH < 0) ? (int)height() - destY : destH;
-
-        int startX = max(0, destX);
-        int startY = max(0, destY);
-        int endX   = min((int)width(), startX + subW);
-        int endY   = min((int)height(), startY + subH);
-
-        float drawW = (float)srcW;
-        float drawH = (float)srcH;
-        float offsetX = (float)startX;
-        float offsetY = (float)startY;
-
-        if (mode == BlitMode::STRETCH) {
-            drawW = (float)subW;
-            drawH = (float)subH;
-        } else if ((mode == BlitMode::FIT) || (mode == BlitMode::FILL)) {
-            float sx = (float)subW / srcW;
-            float sy = (float)subH / srcH;
-            float s  = (mode == BlitMode::FIT) ? min(sx, sy) : max(sx, sy);
-            drawW = srcW * s;
-            drawH = srcH * s;
-            offsetX += (subW - drawW) * 0.5f;
-            offsetY += (subH - drawH) * 0.5f;
-        } else if (mode == BlitMode::CENTER) {
-            offsetX += (subW - srcW) * 0.5f;
-            offsetY += (subH - srcH) * 0.5f;
-        } else if (mode == BlitMode::TOP_RIGHT) {
-            offsetX += (subW - srcW);
-        } else if (mode == BlitMode::BOTTOM_LEFT) {
-            offsetY += (subH - srcH);
-        } else if (mode == BlitMode::BOTTOM_RIGHT) {
-            offsetX += (subW - srcW);
-            offsetY += (subH - srcH);
+        const float radians = fmodf(transform.angle, 360.0f) * DEG_TO_RAD;
+        float sine = sinf(radians), cosine = cosf(radians);
+        // Keep exact quarter-turns aligned with the pixel grid.
+        if (fmodf(transform.angle, 90.0f) == 0.0f)
+        {
+            sine = roundf(sine);
+            cosine = roundf(cosine);
         }
+        const float dux = cosine / transform.scaleX, duy = sine / transform.scaleX;
+        const float dvx = -sine / transform.scaleY, dvy = cosine / transform.scaleY;
+        if (!isfinite(dux) || !isfinite(duy) || !isfinite(dvx) || !isfinite(dvy))
+            return;
 
-        float scaleX = (drawW > 1) ? (srcW - 1) / (drawW - 1) : 0;
-        float scaleY = (drawH > 1) ? (srcH - 1) / (drawH - 1) : 0;
-
-        for (int y = startY; y < endY; y++) {
-            for (int x = startX; x < endX; x++) {
-                float srcXf = (x - offsetX) * scaleX;
-                float srcYf = (y - offsetY) * scaleY;
-                uint16_t c = 0;
-                bool src_set = false;
-
-                if (scaleMode == ScaleMode::NEAREST) {
-                    int xi = (int)roundf(srcXf);
-                    int yi = (int)roundf(srcYf);
-                    if ((xi >= 0) && (xi < (int)srcW) && (yi >= 0) && (yi < (int)srcH)) {
-                        c = pgm_read_word(&src[yi * srcW + xi]);
-                        src_set = true;
-                    }
-                } else if (scaleMode == ScaleMode::BILINEAR) {
-                    int x0 = (int)floorf(srcXf);
-                    int y0 = (int)floorf(srcYf);
-                    int x1 = min(x0 + 1, (int)srcW - 1);
-                    int y1 = min(y0 + 1, (int)srcH - 1);
-                    if ((x0 >= 0) && (x0 < (int)srcW) && (y0 >= 0) && (y0 < (int)srcH)) {
-                        float fx = srcXf - x0;
-                        float fy = srcYf - y0;
-                        uint16_t v00 = pgm_read_word(&src[y0 * srcW + x0]);
-                        uint16_t v10 = pgm_read_word(&src[y0 * srcW + x1]);
-                        uint16_t v01 = pgm_read_word(&src[y1 * srcW + x0]);
-                        uint16_t v11 = pgm_read_word(&src[y1 * srcW + x1]);
-                        auto lerp = [](uint16_t a, uint16_t b, float t) -> uint16_t {
-                            int ar = (a >> 11) & 0x1F, ag = (a >> 5) & 0x3F, ab = a & 0x1F;
-                            int br = (b >> 11) & 0x1F, bg = (b >> 5) & 0x3F, bb = b & 0x1F;
-                            int rr = ar + (int)((br - ar) * t), rg = ag + (int)((bg - ag) * t), rb = ab + (int)((bb - ab) * t);
-                            return (uint16_t)((rr << 11) | (rg << 5) | rb);
-                        };
-                        c = lerp(lerp(v00, v10, fx), lerp(v01, v11, fx), fy);
-                        src_set = true;
-                    }
-                } else if (scaleMode == ScaleMode::AREA) {
-                    float x0 = srcXf, y0 = srcYf, x1 = srcXf + scaleX, y1 = srcYf + scaleY;
-                    float r = 0, g = 0, b = 0, total = 0;
-                    int ix0 = floorf(x0), iy0 = floorf(y0), ix1 = ceilf(x1), iy1 = ceilf(y1);
-                    for (int sy = iy0; sy < iy1; sy++) {
-                        if ((sy < 0) || (sy >= (int)srcH)) continue;
-                        float wy = min(y1, (float)(sy + 1)) - max(y0, (float)sy);
-                        if (wy <= 0) continue;
-                        for (int sx = ix0; sx < ix1; sx++) {
-                            if ((sx < 0) || (sx >= (int)srcW)) continue;
-                            float wx = min(x1, (float)(sx + 1)) - max(x0, (float)sx);
-                            if (wx <= 0) continue;
-                            float w = wx * wy;
-                            uint16_t pix = pgm_read_word(&src[sy * srcW + sx]);
-                            r += ((pix >> 11) & 0x1F) * w;
-                            g += ((pix >> 5) & 0x3F) * w;
-                            b += (pix & 0x1F) * w;
-                            total += w;
-                        }
-                    }
-                    if (total > 0) {
-                        c = ((int)(r / total) << 11) | ((int)(g / total) << 5) | (int)(b / total);
-                        src_set = true;
-                    }
-                }
-                if (src_set) setPixelValue(x, y, c, alpha);
+        float left = INFINITY, top = INFINITY, right = -INFINITY, bottom = -INFINITY;
+        const int edgesX[] = {0, source.width};
+        const int edgesY[] = {0, source.height};
+        for (int y : edgesY)
+        {
+            const float localY = (y - transform.pivotY) * transform.scaleY;
+            for (int x : edgesX)
+            {
+                const float localX = (x - transform.pivotX) * transform.scaleX;
+                const float tx = transform.x + localX * cosine - localY * sine;
+                const float ty = transform.y + localX * sine + localY * cosine;
+                if (!isfinite(tx) || !isfinite(ty))
+                    return;
+                left = min(left, tx);
+                right = max(right, tx);
+                top = min(top, ty);
+                bottom = max(bottom, ty);
             }
         }
-    }
 
-    void blitFromArray(const bool* src,
-                       size_t srcW,
-                       size_t srcH,
-                       uint16_t color,
-                       BlitMode mode,
-                       ScaleMode scaleMode = ScaleMode::BILINEAR,
-                       float alpha = 1.0f,
-                       int destX = 0,
-                       int destY = 0,
-                       int destW = -1,
-                       int destH = -1)
-    {
-        if (!src || srcW == 0 || srcH == 0) return;
-
-        // 1. Calculate Positioning and Geometry
-        int subW = (destW < 0) ? (int)width() - destX : destW;
-        int subH = (destH < 0) ? (int)height() - destY : destH;
-        int startX = max(0, destX);
-        int startY = max(0, destY);
-        int endX   = min((int)width(), startX + subW);
-        int endY   = min((int)height(), startY + subH);
-
-        float drawW = (float)srcW;
-        float drawH = (float)srcH;
-        float offsetX = (float)startX;
-        float offsetY = (float)startY;
-
-        // Apply BlitMode (Positioning)
-        if (mode == BlitMode::STRETCH) {
-            drawW = (float)subW;
-            drawH = (float)subH;
-        } else if ((mode == BlitMode::FIT) || (mode == BlitMode::FILL)) {
-            float sx = (float)subW / srcW;
-            float sy = (float)subH / srcH;
-            float s  = (mode == BlitMode::FIT) ? min(sx, sy) : max(sx, sy);
-            drawW = srcW * s;
-            drawH = srcH * s;
-            offsetX += (subW - drawW) * 0.5f;
-            offsetY += (subH - drawH) * 0.5f;
-        } else if (mode == BlitMode::CENTER) {
-            offsetX += (subW - srcW) * 0.5f;
-            offsetY += (subH - srcH) * 0.5f;
-        } else if (mode == BlitMode::TOP_RIGHT) {
-            offsetX += (subW - srcW);
-        } else if (mode == BlitMode::BOTTOM_LEFT) {
-            offsetY += (subH - srcH);
-        } else if (mode == BlitMode::BOTTOM_RIGHT) {
-            offsetX += (subW - srcW);
-            offsetY += (subH - srcH);
+        // Integer-aligned, unrotated transforms can use the faster rectangle blitter.
+        const float drawW = right - left, drawH = bottom - top;
+        if (sine == 0.0f && cosine == 1.0f && transform.scaleX > 0 && transform.scaleY > 0 &&
+            double(left) >= INT_MIN && double(left) <= INT_MAX &&
+            double(top) >= INT_MIN && double(top) <= INT_MAX &&
+            drawW > 0 && double(drawW) <= INT_MAX && drawH > 0 && double(drawH) <= INT_MAX &&
+            left == floorf(left) && top == floorf(top) &&
+            drawW == floorf(drawW) && drawH == floorf(drawH))
+        {
+            drawRegion(srcW, srcH, source, {int(left), int(top), int(drawW), int(drawH)},
+                       BlitMode::STRETCH, filter, alpha, fetch);
+            return;
         }
 
-        float scaleX = (drawW > 1) ? (srcW - 1) / (drawW - 1) : 0;
-        float scaleY = (drawH > 1) ? (srcH - 1) / (drawH - 1) : 0;
-
-        // 2. Rendering Loop with Binary Masking
-        for (int y = startY; y < endY; y++) {
-            for (int x = startX; x < endX; x++) {
-                
-                // FIX: If the canvas pixel is in the FIT/CENTER letterboxing or pillarboxing 
-                // padding zones, completely ignore it and move to the next pixel.
-                if (x < offsetX || x >= offsetX + drawW || y < offsetY || y >= offsetY + drawH) {
+        alpha = min(1.0f, alpha);
+        const int firstX = max(clip.x, clampEdge(floorf(left), WIDTH));
+        const int lastX = min(clip.x + clip.width, clampEdge(ceilf(right), WIDTH));
+        const int firstY = max(clip.y, clampEdge(floorf(top), HEIGHT));
+        const int lastY = min(clip.y + clip.height, clampEdge(ceilf(bottom), HEIGHT));
+        const size_t start = size_t(source.y) * srcW + source.x;
+        const auto at = [&](int x, int y) { return fetch(start + size_t(y) * srcW + x); };
+        const auto inside = [&](float u, float v) {
+            return u >= 0.0f && v >= 0.0f && double(u) < source.width && double(v) < source.height;
+        };
+        const float xOffset = firstX + 0.5f - transform.x;
+        for (int y = firstY; y < lastY; ++y)
+        {
+            const float yOffset = y + 0.5f - transform.y;
+            const float u0 = transform.pivotX + xOffset * dux + yOffset * duy;
+            const float v0 = transform.pivotY + xOffset * dvx + yOffset * dvy;
+            for (int x = firstX; x < lastX; ++x)
+            {
+                const float u = u0 + (x - firstX) * dux;
+                const float v = v0 + (x - firstX) * dvx;
+                if (filter == ScaleMode::NEAREST)
+                {
+                    if (inside(u, v))
+                    {
+                        const auto sample = at(int(u), int(v));
+                        if (sample.coverage)
+                            setPixelValue(x, y, sample.color, alpha * (sample.coverage / 255.0f));
+                    }
                     continue;
                 }
 
-                float srcXf = (x - offsetX) * scaleX;
-                float srcYf = (y - offsetY) * scaleY;
-                bool draw = false;
-
-                if (scaleMode == ScaleMode::NEAREST) {
-                    int xi = (int)roundf(srcXf);
-                    int yi = (int)roundf(srcYf);
-                    if (xi >= 0 && xi < (int)srcW && yi >= 0 && yi < (int)srcH) {
-                        draw = pgm_read_byte(&src[yi * srcW + xi]);
-                    }
-                } else {
-                    // BILINEAR/AREA logic for bool: perform a local neighborhood OR
-                    int x0 = (int)floorf(srcXf);
-                    int y0 = (int)floorf(srcYf);
-                    int x1 = x0 + 1;
-                    int y1 = y0 + 1;
-                    
-                    // Safe bounds checks for all 4 neighborhood pixels
-                    bool p00 = (x0 >= 0 && x0 < (int)srcW && y0 >= 0 && y0 < (int)srcH) ? pgm_read_byte(&src[y0 * srcW + x0]) : false;
-                    bool p10 = (x1 >= 0 && x1 < (int)srcW && y0 >= 0 && y0 < (int)srcH) ? pgm_read_byte(&src[y0 * srcW + x1]) : false;
-                    bool p01 = (x0 >= 0 && x0 < (int)srcW && y1 >= 0 && y1 < (int)srcH) ? pgm_read_byte(&src[y1 * srcW + x0]) : false;
-                    bool p11 = (x1 >= 0 && x1 < (int)srcW && y1 >= 0 && y1 < (int)srcH) ? pgm_read_byte(&src[y1 * srcW + x1]) : false;
-                    
-                    if (p00 || p10 || p01 || p11) {
-                        draw = true;
+                WeightedPixel pixel;
+                if (filter == ScaleMode::BILINEAR && inside(u, v))
+                    pixel = sampleBilinear(u, v, source.width, source.height, at);
+                else if (filter == ScaleMode::AREA)
+                {
+                    // Approximate the rotated pixel footprint with evenly spaced samples.
+                    for (int sy = 0; sy < 4; ++sy)
+                    {
+                        const float dy = (sy - 1.5f) * 0.25f;
+                        for (int sx = 0; sx < 4; ++sx)
+                        {
+                            const float dx = (sx - 1.5f) * 0.25f;
+                            const float su = u + dx * dux + dy * duy;
+                            const float sv = v + dx * dvx + dy * dvy;
+                            if (inside(su, sv))
+                                pixel.add(at(int(su), int(sv)), 1.0f / 16.0f);
+                        }
                     }
                 }
-
-                // Apply color and alpha only where the mask is true
-                if (draw) {
-                    setPixelValue(x, y, color, alpha);
-                }
+                if (pixel.coverage > 0.0f)
+                    setPixelValue(x, y, pixel.color(), alpha * min(1.0f, pixel.coverage));
             }
         }
     }
 
+    template <typename Fetch>
+    void blit(size_t srcW, size_t srcH, BlitMode mode, ScaleMode scaleMode,
+              float alpha, int destX, int destY, int destW, int destH, Fetch fetch,
+              size_t stride = 0, size_t sourceOffset = 0)
+    {
+        const auto clip = getClipRect();
+        if (!srcW || !srcH || srcW > INT_MAX || srcH > INT_MAX ||
+            srcW > SIZE_MAX / srcH || !(alpha > 0))
+            return;
+
+        const int64_t boxW = destW < 0 ? int64_t(WIDTH) - destX : destW;
+        const int64_t boxH = destH < 0 ? int64_t(HEIGHT) - destY : destH;
+        if (boxW <= 0 || boxH <= 0)
+            return;
+        alpha = min(1.0f, alpha);
+        const int x0 = max(clip.x, destX), y0 = max(clip.y, destY);
+        const int x1 = int(min(int64_t(clip.x + clip.width), destX + boxW));
+        const int y1 = int(min(int64_t(clip.y + clip.height), destY + boxH));
+        if (x0 >= x1 || y0 >= y1)
+            return;
+
+        float drawW = srcW, drawH = srcH;
+        float left = destX, top = destY;
+        if (mode == BlitMode::STRETCH)
+        {
+            drawW = boxW;
+            drawH = boxH;
+        }
+        else if (mode == BlitMode::FIT || mode == BlitMode::FILL)
+        {
+            const float sx = float(boxW) / srcW, sy = float(boxH) / srcH;
+            const float scale = mode == BlitMode::FIT ? min(sx, sy) : max(sx, sy);
+            drawW *= scale;
+            drawH *= scale;
+        }
+
+        if (mode == BlitMode::CENTER || mode == BlitMode::FIT || mode == BlitMode::FILL)
+        {
+            left += (boxW - drawW) * 0.5f;
+            top += (boxH - drawH) * 0.5f;
+        }
+        if (mode == BlitMode::TOP_RIGHT || mode == BlitMode::BOTTOM_RIGHT)
+            left += boxW - drawW;
+        if (mode == BlitMode::BOTTOM_LEFT || mode == BlitMode::BOTTOM_RIGHT)
+            top += boxH - drawH;
+
+        const float scaleX = srcW / drawW, scaleY = srcH / drawH;
+        if (!stride)
+            stride = srcW;
+        const auto at = [&](int sx, int sy) {
+            return fetch(sourceOffset + size_t(sy) * stride + sx);
+        };
+        if (scaleMode == ScaleMode::NEAREST)
+        {
+            // Common native-size and 2x blits can map coordinates with integer shifts.
+            const bool integralOrigin = left == floorf(left) && top == floorf(top);
+            if (integralOrigin && (scaleX == 1.0f || scaleX == 0.5f) &&
+                (scaleY == 1.0f || scaleY == 0.5f))
+            {
+                const int firstX = max(x0, lowerBound(int64_t(left), WIDTH));
+                const int firstY = max(y0, lowerBound(int64_t(top), HEIGHT));
+                const int lastX = min(x1, lowerBound(int64_t(left) + int64_t(drawW), WIDTH));
+                const int lastY = min(y1, lowerBound(int64_t(top) + int64_t(drawH), HEIGHT));
+                const unsigned shiftX = scaleX == 0.5f, shiftY = scaleY == 0.5f;
+                for (int y = firstY; y < lastY; ++y)
+                {
+                    const size_t srcRow = sourceOffset +
+                        size_t((int64_t(y) - int64_t(top)) >> shiftY) * stride;
+                    size_t dst = size_t(y) * WIDTH + firstX;
+                    size_t srcX = size_t(int64_t(firstX) - int64_t(left));
+                    for (int x = firstX; x < lastX; ++x, ++dst, ++srcX)
+                    {
+                        const auto sample = fetch(srcRow + (srcX >> shiftX));
+                        if (sample.coverage)
+                            composite(dst, sample.color, alpha * (sample.coverage / 255.0f));
+                    }
+                }
+                return;
+            }
+
+            for (int y = y0; y < y1; ++y)
+            {
+                const float v = y + 0.5f - top;
+                if (v < 0.0f || v >= drawH)
+                    continue;
+                const int sy = int(min(float(srcH - 1), v * scaleY));
+                for (int x = x0; x < x1; ++x)
+                {
+                    const float u = x + 0.5f - left;
+                    if (u < 0.0f || u >= drawW)
+                        continue;
+                    const auto sample = at(int(min(float(srcW - 1), u * scaleX)), sy);
+                    if (sample.coverage)
+                        setPixelValue(x, y, sample.color, alpha * (sample.coverage / 255.0f));
+                }
+            }
+            return;
+        }
+
+        for (int y = y0; y < y1; ++y)
+        {
+            const float v = y + 0.5f - top;
+            if (v < 0.0f || v >= drawH)
+                continue;
+            for (int x = x0; x < x1; ++x)
+            {
+                const float u = x + 0.5f - left;
+                if (u < 0.0f || u >= drawW)
+                    continue;
+
+                WeightedPixel pixel;
+                if (scaleMode == ScaleMode::BILINEAR)
+                {
+                    pixel = sampleBilinear(u * scaleX, v * scaleY, int(srcW), int(srcH), at);
+                }
+                else if (scaleMode == ScaleMode::AREA)
+                {
+                    const float lx = max(0.0f, (u - 0.5f) * scaleX);
+                    const float rx = min(float(srcW), (u + 0.5f) * scaleX);
+                    const float ly = max(0.0f, (v - 0.5f) * scaleY);
+                    const float ry = min(float(srcH), (v + 0.5f) * scaleY);
+                    const float area = (rx - lx) * (ry - ly);
+                    if (area <= 0.0f)
+                        continue;
+                    const int endY = min(int(srcH), int(ceilf(ry)));
+                    const int endX = min(int(srcW), int(ceilf(rx)));
+                    for (int sy = int(ly); sy < endY; ++sy)
+                    {
+                        const float dy = min(ry, float(sy + 1)) - max(ly, float(sy));
+                        for (int sx = int(lx); sx < endX; ++sx)
+                        {
+                            const float dx = min(rx, float(sx + 1)) - max(lx, float(sx));
+                            pixel.add(at(sx, sy), dx * dy / area);
+                        }
+                    }
+                }
+                if (pixel.coverage > 0.0f)
+                    setPixelValue(x, y, pixel.color(), alpha * min(1.0f, pixel.coverage));
+            }
+        }
+    }
+
+public:
     void print(int x,
                int y,
                const char* str,
@@ -1365,51 +1377,48 @@ public:
                int maxGlyphHeight = -1,
                float spacingPercent = 0.0f)
     {
-        int currentX = x;
-        int origHeight = font.getHeight();
-        if (origHeight <= 0) return; // Protect against division by zero
+        const auto clip = getClipRect();
+        if (!str || font.getHeight() <= 0)
+            return;
+        const int nativeHeight = font.getHeight();
+        const int height = maxGlyphHeight > 0 ? maxGlyphHeight : nativeHeight;
+        const int firstRow = lowerBound(int64_t(clip.y) - y, height);
+        const int lastRow = lowerBound(int64_t(clip.y) + clip.height - y, height);
+        if (firstRow >= lastRow)
+            return;
 
-        // Fallback: If no max width/height constraint is passed, use the font's native size
-        if (maxGlyphHeight <= 0) {
-            maxGlyphHeight = origHeight;
-        }
+        const double spacing = round(double(height) * spacingPercent);
+        if (!(spacing >= INT_MIN && spacing <= INT_MAX))
+            return;
 
-        // Calculate the precise pixel gap to add between characters using rounding (+0.5f)
-        int spacingPixels = (int)(maxGlyphHeight * spacingPercent + 0.5f);
-
-        while (*str) {
-            char c = *str;
-            Glyph glyph = font.lookupChar(c);
-
-            if (glyph.data != nullptr) {
-                // Proportionally scale the character width based on the target height constraint
-                int targetWidth = (int)(((float)glyph.width * maxGlyphHeight) / origHeight + 0.5f);
-                if (targetWidth <= 0) targetWidth = 1; // Guarantee at least a 1-pixel column width
-
-                // Scale and draw the glyph matrix via integer-mapped nearest-neighbor interpolation
-                for (int row = 0; row < maxGlyphHeight; row++) {
-                    int origRow = (row * origHeight) / maxGlyphHeight;
-                    
-                    for (int col = 0; col < targetWidth; col++) {
-                        int origCol = (col * glyph.width) / targetWidth;
-                        int progmemIndex = origRow * glyph.width + origCol;
-                        
-                        // Read data bit out of Flash Memory safely
-                        bool pixelActive = pgm_read_byte(&(glyph.data[progmemIndex]));
-                        
-                        if (pixelActive) {
-                            this->setPixelValue(currentX + col, y + row, (uint16_t)color);
-                        }
-                    }
-                }
-                // Move cursor forward: Scaled Width + The custom proportional spacing gap
-                currentX += targetWidth + spacingPixels;
-            } 
-            else if (c == ' ') {
-                // Scale the blank space width (1/3 of total height) + The custom spacing gap
-                currentX += (maxGlyphHeight / 3) + spacingPixels;
+        int64_t cursor = x;
+        while (*str)
+        {
+            const char c = *str++;
+            const Glyph glyph = font.lookupChar(c);
+            if (!glyph.data || glyph.width <= 0 ||
+                size_t(glyph.width) > SIZE_MAX / size_t(nativeHeight))
+            {
+                if (c == ' ')
+                    cursor += int64_t(height / 3) + int(spacing);
+                continue;
             }
-            str++;
+
+            const int64_t scaledWidth = (int64_t(glyph.width) * height + nativeHeight / 2) / nativeHeight;
+            const int width = int(min(int64_t(INT_MAX), max(int64_t(1), scaledWidth)));
+            const int firstColumn = lowerBound(int64_t(clip.x) - cursor, width);
+            const int lastColumn = lowerBound(int64_t(clip.x) + clip.width - cursor, width);
+            for (int row = firstRow; row < lastRow; ++row)
+            {
+                const size_t source = size_t(int64_t(row) * nativeHeight / height) * glyph.width;
+                for (int col = firstColumn; col < lastColumn; ++col)
+                {
+                    const size_t column = int64_t(col) * glyph.width / width;
+                    if (pgm_read_byte(glyph.data + source + column))
+                        setPixelValue(int(cursor + col), y + row, uint16_t(color));
+                }
+            }
+            cursor += int64_t(width) + int(spacing);
         }
     }
 };
