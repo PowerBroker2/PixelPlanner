@@ -26,6 +26,31 @@ public:
 
 #endif // CUSTOM_BITMAP_FONT_H
 
+enum class BitmapFilter { PRESERVE_STROKES, NEAREST };
+
+// Partition the source raster into output cells when shrinking. Every ink pixel
+// belongs to a cell, so thin strokes cannot disappear between sample points.
+inline bool sampleBitmapGlyph(Glyph glyph, int nativeHeight, int width, int height, int x, int y,
+                              BitmapFilter filter = BitmapFilter::PRESERVE_STROKES)
+{
+    if (!glyph.data || glyph.width <= 0 || nativeHeight <= 0 || x < 0 || y < 0 ||
+        x >= width || y >= height || size_t(glyph.width) > SIZE_MAX / size_t(nativeHeight))
+        return false;
+    const int left = width == glyph.width ? x : int(int64_t(x) * glyph.width / width);
+    const int top = height == nativeHeight ? y : int(int64_t(y) * nativeHeight / height);
+    const int right = filter == BitmapFilter::PRESERVE_STROKES && width < glyph.width
+        ? int((int64_t(x) + 1) * glyph.width / width) : left + 1;
+    const int bottom = filter == BitmapFilter::PRESERVE_STROKES && height < nativeHeight
+        ? int((int64_t(y) + 1) * nativeHeight / height) : top + 1;
+    for (int row = top; row < bottom; ++row)
+    {
+        const bool* source = glyph.data + size_t(row) * glyph.width;
+        for (int col = left; col < right; ++col)
+            if (pgm_read_byte(source + col)) return true;
+    }
+    return false;
+}
+
 /**
  * @brief Defines how a source image is positioned within the destination Pixmap.
  */
@@ -961,11 +986,14 @@ public:
     void blitFromArray(const uint16_t* src, size_t srcW, size_t srcH,
                        BlitMode mode, ScaleMode scaleMode = ScaleMode::BILINEAR,
                        float alpha = 1.0f, int destX = 0, int destY = 0,
-                       int destW = -1, int destH = -1)
+                       int destW = -1, int destH = -1, const bool* mask = nullptr)
     {
         if (src)
             blit(srcW, srcH, mode, scaleMode, alpha, destX, destY, destW, destH,
-                 [&](size_t i) { return Sample{pgm_read_word(src + i), 255}; });
+                 [&](size_t i) {
+                     const uint8_t coverage = !mask || pgm_read_byte(mask + i) ? 255 : 0;
+                     return Sample{pgm_read_word(src + i), coverage};
+                 });
     }
 
     void blitFromArray(const bool* src, size_t srcW, size_t srcH, uint16_t color,
@@ -1375,7 +1403,8 @@ public:
                const BitmapFont& font,
                uint32_t color,
                int maxGlyphHeight = -1,
-               float spacingPercent = 0.0f)
+               float spacingPercent = 0.0f,
+               BitmapFilter filter = BitmapFilter::PRESERVE_STROKES)
     {
         const auto clip = getClipRect();
         if (!str || font.getHeight() <= 0)
@@ -1410,11 +1439,9 @@ public:
             const int lastColumn = lowerBound(int64_t(clip.x) + clip.width - cursor, width);
             for (int row = firstRow; row < lastRow; ++row)
             {
-                const size_t source = size_t(int64_t(row) * nativeHeight / height) * glyph.width;
                 for (int col = firstColumn; col < lastColumn; ++col)
                 {
-                    const size_t column = int64_t(col) * glyph.width / width;
-                    if (pgm_read_byte(glyph.data + source + column))
+                    if (sampleBitmapGlyph(glyph, nativeHeight, width, height, col, row, filter))
                         setPixelValue(int(cursor + col), y + row, uint16_t(color));
                 }
             }
